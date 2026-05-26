@@ -561,12 +561,7 @@ fn install_bridge(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    /// Serializes tests that mutate process-wide environment variables so
-    /// they don't race each other when cargo runs them in parallel.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn make_fake_source(dir: &Path) {
         fs::create_dir_all(dir).unwrap();
@@ -653,41 +648,32 @@ mod tests {
 
     #[test]
     fn resolve_source_dir_prefers_cli_override() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env::EnvGuard::set_opt("VOXTYPE_QUICKSHELL_SOURCE_DIR", None);
         let valid = TempDir::new().unwrap();
         make_fake_source(valid.path());
 
         // Set env var to point at an INVALID dir; CLI override should win.
         let bogus = TempDir::new().unwrap();
-        // SAFETY: tests in this module are single-threaded thanks to env mutation;
-        // each test must own its env-var lifetime.
-        unsafe {
-            env::set_var("VOXTYPE_QUICKSHELL_SOURCE_DIR", bogus.path());
-        }
+        let _env = crate::test_env::EnvGuard::set(
+            "VOXTYPE_QUICKSHELL_SOURCE_DIR",
+            bogus.path().to_str().unwrap(),
+        );
 
         let resolved = resolve_source_dir(Some(valid.path())).unwrap();
         assert_eq!(resolved, valid.path());
-
-        unsafe {
-            env::remove_var("VOXTYPE_QUICKSHELL_SOURCE_DIR");
-        }
     }
 
     #[test]
     fn resolve_source_dir_honors_env_var() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let valid = TempDir::new().unwrap();
         make_fake_source(valid.path());
 
-        unsafe {
-            env::set_var("VOXTYPE_QUICKSHELL_SOURCE_DIR", valid.path());
-        }
+        let _env = crate::test_env::EnvGuard::set(
+            "VOXTYPE_QUICKSHELL_SOURCE_DIR",
+            valid.path().to_str().unwrap(),
+        );
         let resolved = resolve_source_dir(None).unwrap();
         assert_eq!(resolved, valid.path());
-
-        unsafe {
-            env::remove_var("VOXTYPE_QUICKSHELL_SOURCE_DIR");
-        }
     }
 
     fn make_fake_bridge(path: &Path) {
@@ -709,29 +695,22 @@ mod tests {
 
     #[test]
     fn resolve_bridge_source_honors_env_var() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         let bin = dir.path().join("voxtype-audio-bridge");
         make_fake_bridge(&bin);
 
-        unsafe {
-            env::set_var("VOXTYPE_AUDIO_BRIDGE_BINARY", &bin);
-        }
+        let _env = crate::test_env::EnvGuard::set(
+            "VOXTYPE_AUDIO_BRIDGE_BINARY",
+            bin.to_str().unwrap(),
+        );
         let resolved = resolve_bridge_source(None).unwrap();
-        unsafe {
-            env::remove_var("VOXTYPE_AUDIO_BRIDGE_BINARY");
-        }
         assert_eq!(resolved, BridgeSource::Path(bin));
     }
 
     #[test]
     fn resolve_bridge_source_returns_none_when_missing() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Make sure no env override is set, and the search will hit
-        // /usr/lib/voxtype/... only if it actually exists on disk.
-        unsafe {
-            env::remove_var("VOXTYPE_AUDIO_BRIDGE_BINARY");
-        }
+        // Make sure no env override is set.
+        let _env = crate::test_env::EnvGuard::remove("VOXTYPE_AUDIO_BRIDGE_BINARY");
         // Pass a non-existent CLI path — should fall through to system
         // paths and PATH lookup. We can't deterministically guarantee
         // those are absent, but we can at least confirm that with a
@@ -743,17 +722,13 @@ mod tests {
 
     #[test]
     fn install_bridge_symlink_creates_link() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let src_dir = TempDir::new().unwrap();
         let bin = src_dir.path().join("voxtype-audio-bridge");
         make_fake_bridge(&bin);
 
         // Pretend the target is under HOME by setting HOME to a tmpdir.
         let fake_home = TempDir::new().unwrap();
-        let prev_home = env::var("HOME").ok();
-        unsafe {
-            env::set_var("HOME", fake_home.path());
-        }
+        let _env = crate::test_env::EnvGuard::set("HOME", fake_home.path().to_str().unwrap());
         let target = fake_home.path().join(".local/bin/voxtype-audio-bridge");
 
         let outcome = install_bridge_symlink(&bin, &target, false).unwrap();
@@ -761,27 +736,16 @@ mod tests {
         let md = fs::symlink_metadata(&target).unwrap();
         assert!(md.file_type().is_symlink());
         assert_eq!(fs::read_link(&target).unwrap(), bin);
-
-        unsafe {
-            match prev_home {
-                Some(v) => env::set_var("HOME", v),
-                None => env::remove_var("HOME"),
-            }
-        }
     }
 
     #[test]
     fn install_bridge_symlink_is_idempotent_when_matches() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let src_dir = TempDir::new().unwrap();
         let bin = src_dir.path().join("voxtype-audio-bridge");
         make_fake_bridge(&bin);
 
         let fake_home = TempDir::new().unwrap();
-        let prev_home = env::var("HOME").ok();
-        unsafe {
-            env::set_var("HOME", fake_home.path());
-        }
+        let _env = crate::test_env::EnvGuard::set("HOME", fake_home.path().to_str().unwrap());
         let target = fake_home.path().join(".local/bin/voxtype-audio-bridge");
 
         let first = install_bridge_symlink(&bin, &target, false).unwrap();
@@ -789,18 +753,10 @@ mod tests {
 
         let second = install_bridge_symlink(&bin, &target, false).unwrap();
         assert_eq!(second, BridgeInstallOutcome::AlreadyLinked);
-
-        unsafe {
-            match prev_home {
-                Some(v) => env::set_var("HOME", v),
-                None => env::remove_var("HOME"),
-            }
-        }
     }
 
     #[test]
     fn install_bridge_symlink_refuses_overwrite_without_force() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let src_dir = TempDir::new().unwrap();
         let bin_a = src_dir.path().join("voxtype-audio-bridge");
         let bin_b = src_dir.path().join("some-other-binary");
@@ -808,10 +764,7 @@ mod tests {
         make_fake_bridge(&bin_b);
 
         let fake_home = TempDir::new().unwrap();
-        let prev_home = env::var("HOME").ok();
-        unsafe {
-            env::set_var("HOME", fake_home.path());
-        }
+        let _env = crate::test_env::EnvGuard::set("HOME", fake_home.path().to_str().unwrap());
         let target = fake_home.path().join(".local/bin/voxtype-audio-bridge");
 
         // First install points to bin_b.
@@ -833,18 +786,10 @@ mod tests {
         let outcome = install_bridge_symlink(&bin_a, &target, true).unwrap();
         assert_eq!(outcome, BridgeInstallOutcome::Linked);
         assert_eq!(fs::read_link(&target).unwrap(), bin_a);
-
-        unsafe {
-            match prev_home {
-                Some(v) => env::set_var("HOME", v),
-                None => env::remove_var("HOME"),
-            }
-        }
     }
 
     #[test]
     fn install_bridge_symlink_refuses_outside_home_without_force() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let src_dir = TempDir::new().unwrap();
         let bin = src_dir.path().join("voxtype-audio-bridge");
         make_fake_bridge(&bin);
@@ -852,48 +797,27 @@ mod tests {
         // Point HOME at a tmpdir, and try to install OUTSIDE of it.
         let fake_home = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
-        let prev_home = env::var("HOME").ok();
-        unsafe {
-            env::set_var("HOME", fake_home.path());
-        }
+        let _env = crate::test_env::EnvGuard::set("HOME", fake_home.path().to_str().unwrap());
         let target = outside.path().join("voxtype-audio-bridge");
 
         let err = install_bridge_symlink(&bin, &target, false).unwrap_err();
         let msg = format!("{}", err);
         assert!(msg.contains("outside of HOME"), "got: {}", msg);
         assert!(!target.exists(), "target should not exist after refusal");
-
-        unsafe {
-            match prev_home {
-                Some(v) => env::set_var("HOME", v),
-                None => env::remove_var("HOME"),
-            }
-        }
     }
 
     #[test]
     fn default_bridge_target_honors_xdg_bin_home() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = env::var("XDG_BIN_HOME").ok();
-        unsafe {
-            env::set_var("XDG_BIN_HOME", "/tmp/voxtype-test-bin");
-        }
+        let _env = crate::test_env::EnvGuard::set("XDG_BIN_HOME", "/tmp/voxtype-test-bin");
         let dir = default_bridge_target();
         assert_eq!(
             dir,
             PathBuf::from("/tmp/voxtype-test-bin/voxtype-audio-bridge")
         );
-        unsafe {
-            match prev {
-                Some(v) => env::set_var("XDG_BIN_HOME", v),
-                None => env::remove_var("XDG_BIN_HOME"),
-            }
-        }
     }
 
     #[test]
     fn run_with_skip_bridge_does_not_touch_target() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Stage a source tree so the QML install succeeds.
         let src = TempDir::new().unwrap();
         make_fake_source(src.path());
@@ -903,12 +827,8 @@ mod tests {
         // bridge install would land there (we then assert it didn't).
         let fake_home = TempDir::new().unwrap();
         let bin_home = fake_home.path().join(".local/bin");
-        let prev_home = env::var("HOME").ok();
-        let prev_xdg = env::var("XDG_BIN_HOME").ok();
-        unsafe {
-            env::set_var("HOME", fake_home.path());
-            env::set_var("XDG_BIN_HOME", &bin_home);
-        }
+        let _env_home = crate::test_env::EnvGuard::set("HOME", fake_home.path().to_str().unwrap());
+        let _env_xdg = crate::test_env::EnvGuard::set("XDG_BIN_HOME", bin_home.to_str().unwrap());
 
         run(
             Some(dst.path().to_path_buf()),
@@ -925,37 +845,15 @@ mod tests {
             !bin_home.join("voxtype-audio-bridge").exists(),
             "skip_bridge should leave the target untouched"
         );
-
-        unsafe {
-            match prev_home {
-                Some(v) => env::set_var("HOME", v),
-                None => env::remove_var("HOME"),
-            }
-            match prev_xdg {
-                Some(v) => env::set_var("XDG_BIN_HOME", v),
-                None => env::remove_var("XDG_BIN_HOME"),
-            }
-        }
     }
 
     #[test]
     fn default_target_dir_honors_xdg_data_home() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Save and restore env to avoid clobbering other tests.
-        let prev = env::var("XDG_DATA_HOME").ok();
-        unsafe {
-            env::set_var("XDG_DATA_HOME", "/tmp/voxtype-test-xdg");
-        }
+        let _env = crate::test_env::EnvGuard::set("XDG_DATA_HOME", "/tmp/voxtype-test-xdg");
         let dir = default_target_dir();
         assert_eq!(
             dir,
             PathBuf::from("/tmp/voxtype-test-xdg/voxtype/quickshell")
         );
-        unsafe {
-            match prev {
-                Some(v) => env::set_var("XDG_DATA_HOME", v),
-                None => env::remove_var("XDG_DATA_HOME"),
-            }
-        }
     }
 }

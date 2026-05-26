@@ -300,40 +300,9 @@ mod tests {
         assert!(dot_pos < enter_pos);
     }
 
-    /// Serialize tests that mutate `DOTOOL_PIPE` — Rust's default
-    /// parallel test runner would otherwise see one test's env change
-    /// from another. RAII guard restores the prior value on drop so a
-    /// panicking test doesn't pollute the rest of the run.
-    static DOTOOL_PIPE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    struct DotoolPipeEnvGuard {
-        prior: Option<String>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl DotoolPipeEnvGuard {
-        fn set(value: &str) -> Self {
-            // Allow re-entry on a poisoned lock; one panicking test
-            // shouldn't break every subsequent test in the same file.
-            let lock = DOTOOL_PIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let prior = std::env::var("DOTOOL_PIPE").ok();
-            std::env::set_var("DOTOOL_PIPE", value);
-            Self { prior, _lock: lock }
-        }
-    }
-
-    impl Drop for DotoolPipeEnvGuard {
-        fn drop(&mut self) {
-            match self.prior.take() {
-                Some(v) => std::env::set_var("DOTOOL_PIPE", v),
-                None => std::env::remove_var("DOTOOL_PIPE"),
-            }
-        }
-    }
-
     #[test]
     fn daemon_pipe_detection_respects_env_var() {
-        let _guard = DotoolPipeEnvGuard::set("/nonexistent/dotool-pipe-test");
+        let _guard = crate::test_env::EnvGuard::set("DOTOOL_PIPE", "/nonexistent/dotool-pipe-test");
         assert!(DotoolOutput::daemon_pipe_path().is_none());
     }
 }

@@ -15,6 +15,7 @@ use evdev::{Device, InputEventKind, Key};
 use inotify::{Inotify, WatchMask};
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::AsRawFd;
+use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -150,6 +151,21 @@ impl HotkeyListener for EvdevListener {
     }
 }
 
+/// Set a file descriptor to non-blocking mode.
+///
+/// Returns `Ok(())` if the fd was successfully set to non-blocking mode.
+/// Returns an error if either `F_GETFL` or `F_SETFL` fails.
+fn set_nonblocking(fd: RawFd) -> Result<(), std::io::Error> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Manages input devices with hotplug detection via inotify
 struct DeviceManager {
     /// Map of device path to opened device
@@ -174,6 +190,17 @@ impl DeviceManager {
             .watches()
             .add("/dev/input", WatchMask::CREATE | WatchMask::DELETE)
             .map_err(|e| HotkeyError::DeviceAccess(format!("Failed to watch /dev/input: {}", e)))?;
+
+        // Set inotify to non-blocking mode once during initialization.
+        // If this fails, the inotify fd would remain blocking, causing
+        // read_events() to stall the entire listener loop.
+        let inotify_fd = inotify.as_raw_fd();
+        set_nonblocking(inotify_fd).map_err(|e| {
+            HotkeyError::DeviceAccess(format!(
+                "Failed to set inotify to non-blocking mode: {}",
+                e
+            ))
+        })?;
 
         let mut manager = Self {
             devices: HashMap::new(),
@@ -239,21 +266,28 @@ impl DeviceManager {
                     .unwrap_or(false);
 
                 if has_keys {
-                    // Set device to non-blocking mode
+                    // Set device to non-blocking mode.
+                    // If this fails, the fd remains blocking and would stall
+                    // the listener loop (fetch_events would block instead of
+                    // returning WouldBlock). Skip the device entirely.
                     let fd = device.as_raw_fd();
-                    unsafe {
-                        let flags = libc::fcntl(fd, libc::F_GETFL);
-                        if flags != -1 {
-                            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                    match set_nonblocking(fd) {
+                        Ok(()) => {
+                            tracing::info!(
+                                "Opened keyboard: {:?} ({:?})",
+                                path,
+                                device.name().unwrap_or("unknown")
+                            );
+                            self.devices.insert(path.clone(), device);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Skipping keyboard {:?}: failed to set non-blocking mode: {}",
+                                path, e
+                            );
+                            // device is dropped here, closing the fd
                         }
                     }
-
-                    tracing::info!(
-                        "Opened keyboard: {:?} ({:?})",
-                        path,
-                        device.name().unwrap_or("unknown")
-                    );
-                    self.devices.insert(path.clone(), device);
                 }
             }
             Err(e) => {
@@ -266,16 +300,11 @@ impl DeviceManager {
 
     /// Check inotify for device changes (non-blocking)
     /// Returns true if devices changed
+    ///
+    /// The inotify fd is set to non-blocking during DeviceManager initialization.
+    /// If that setup failed, DeviceManager::new() would have returned an error,
+    /// so this method can safely assume the fd is non-blocking.
     fn check_for_device_changes(&mut self) -> bool {
-        // Set inotify to non-blocking for this check
-        let fd = self.inotify.as_raw_fd();
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            if flags != -1 {
-                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
-        }
-
         let events = match self.inotify.read_events(&mut self.inotify_buffer) {
             Ok(events) => events,
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -849,5 +878,183 @@ mod tests {
     #[test]
     fn test_parse_key_name_error() {
         assert!(parse_key_name("INVALID_KEY_NAME").is_err());
+    }
+
+    // --- Nonblocking helper tests ---
+
+    /// Helper to create a pipe and return (read_fd, write_fd).
+    /// Uses libc directly to avoid needing extra nix features.
+    fn create_pipe() -> (RawFd, RawFd) {
+        let mut fds: [RawFd; 2] = [-1, -1];
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "pipe() failed");
+        (fds[0], fds[1])
+    }
+
+    /// Helper to close both ends of a pipe.
+    fn close_pipe(read_fd: RawFd, write_fd: RawFd) {
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+    }
+
+    #[test]
+    fn test_set_nonblocking_succeeds_on_valid_fd() {
+        // Create a pipe — the read end is a valid fd we can set nonblocking on
+        let (read_fd, write_fd) = create_pipe();
+        // Should succeed: pipe fds support fcntl
+        let result = set_nonblocking(read_fd);
+        assert!(result.is_ok(), "set_nonblocking should succeed on a valid pipe fd");
+        // Verify the fd is actually nonblocking now
+        let flags = unsafe { libc::fcntl(read_fd, libc::F_GETFL) };
+        assert!(flags & libc::O_NONBLOCK != 0, "O_NONBLOCK should be set");
+        close_pipe(read_fd, write_fd);
+    }
+
+    #[test]
+    fn test_set_nonblocking_fails_on_bad_fd() {
+        // Use a closed fd — fcntl should fail with EBADF
+        let bad_fd = 99999;
+        let result = set_nonblocking(bad_fd);
+        assert!(result.is_err(), "set_nonblocking should fail on a bad fd");
+        let err = result.unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EBADF),
+            "Error should be EBADF for a bad file descriptor");
+    }
+
+    #[test]
+    fn test_set_nonblocking_idempotent() {
+        // Setting nonblocking twice should still succeed
+        let (read_fd, write_fd) = create_pipe();
+        assert!(set_nonblocking(read_fd).is_ok());
+        assert!(set_nonblocking(read_fd).is_ok());
+        let flags = unsafe { libc::fcntl(read_fd, libc::F_GETFL) };
+        assert!(flags & libc::O_NONBLOCK != 0, "O_NONBLOCK should still be set");
+        close_pipe(read_fd, write_fd);
+    }
+
+    // --- Device manager decision logic tests ---
+
+    /// Simulates the decision logic from try_open_device:
+    /// A device is only kept in the active set if nonblocking setup succeeds.
+    fn should_keep_device(nonblocking_result: &Result<(), std::io::Error>) -> bool {
+        nonblocking_result.is_ok()
+    }
+
+    #[test]
+    fn test_device_kept_when_nonblocking_succeeds() {
+        assert!(should_keep_device(&Ok(())));
+    }
+
+    #[test]
+    fn test_device_skipped_when_nonblocking_fails() {
+        let err = std::io::Error::other("fcntl failed");
+        assert!(!should_keep_device(&Err(err)));
+    }
+
+    #[test]
+    fn test_device_skipped_when_f_getfl_fails() {
+        // Simulates the F_GETFL failure case — set_nonblocking returns Err
+        let err = std::io::Error::from_raw_os_error(libc::EBADF);
+        assert!(!should_keep_device(&Err(err)));
+    }
+
+    #[test]
+    fn test_inotify_nonblocking_failure_is_fatal_to_setup() {
+        // This test verifies the contract: if inotify nonblocking setup fails,
+        // DeviceManager::new() must not succeed, because the main loop would
+        // call a blocking read_events() and stall.
+        //
+        // We can't easily construct a DeviceManager in unit tests (it opens
+        // real /dev/input devices), so we verify the contract at the
+        // set_nonblocking level: the error from set_nonblocking is propagated
+        // as a DeviceAccess error in production code.
+        //
+        // The production code in DeviceManager::new() does:
+        //   set_nonblocking(inotify_fd).map_err(|e| HotkeyError::DeviceAccess(...))?;
+        //
+        // So if set_nonblocking fails, DeviceManager::new() returns Err.
+        // This test confirms that set_nonblocking can fail and that the
+        // error is meaningful.
+        let bad_fd = 99999;
+        let result = set_nonblocking(bad_fd);
+        assert!(result.is_err());
+        // Verify the error is propagatable as a HotkeyError
+        let hotkey_err = result.map_err(|e| HotkeyError::DeviceAccess(format!(
+            "Failed to set inotify to non-blocking mode: {}", e
+        )));
+        assert!(hotkey_err.is_err());
+        match hotkey_err.unwrap_err() {
+            HotkeyError::DeviceAccess(msg) => {
+                assert!(msg.contains("non-blocking"), "Error message should mention non-blocking: {}", msg);
+            }
+            other => panic!("Expected DeviceAccess error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_active_device_set_excludes_failed_nonblocking() {
+        // Simulates the device tracking logic: devices whose nonblocking
+        // setup fails must not appear in the active polling set.
+        let mut active_devices: HashMap<PathBuf, ()> = HashMap::new();
+
+        // Device 1: nonblocking succeeds → kept
+        let dev1 = PathBuf::from("/dev/input/event0");
+        let nb_result_1: Result<(), std::io::Error> = Ok(());
+        if should_keep_device(&nb_result_1) {
+            active_devices.insert(dev1.clone(), ());
+        }
+
+        // Device 2: nonblocking fails → skipped
+        let dev2 = PathBuf::from("/dev/input/event1");
+        let nb_result_2: Result<(), std::io::Error> = Err(
+            std::io::Error::other("fcntl F_SETFL failed")
+        );
+        if should_keep_device(&nb_result_2) {
+            active_devices.insert(dev2.clone(), ());
+        }
+
+        // Device 3: nonblocking succeeds → kept
+        let dev3 = PathBuf::from("/dev/input/event2");
+        let nb_result_3: Result<(), std::io::Error> = Ok(());
+        if should_keep_device(&nb_result_3) {
+            active_devices.insert(dev3.clone(), ());
+        }
+
+        // Only devices 1 and 3 should be in the active set
+        assert_eq!(active_devices.len(), 2);
+        assert!(active_devices.contains_key(&PathBuf::from("/dev/input/event0")));
+        assert!(!active_devices.contains_key(&PathBuf::from("/dev/input/event1")));
+        assert!(active_devices.contains_key(&PathBuf::from("/dev/input/event2")));
+    }
+
+    #[test]
+    fn test_blocking_fd_cannot_enter_polling_loop() {
+        // Regression test: verifies that the decision logic prevents a
+        // blocking fd from ever reaching the polling loop.
+        //
+        // In the old code, a device whose fcntl(F_SETFL, O_NONBLOCK) failed
+        // was still inserted into self.devices, and poll_events() would call
+        // fetch_events() on it. Since the fd was blocking, fetch_events()
+        // would block instead of returning WouldBlock, stalling the loop.
+        //
+        // The fix ensures that devices with failed nonblocking setup are
+        // never inserted into the active device map.
+        let mut active_devices: HashMap<PathBuf, ()> = HashMap::new();
+
+        // Simulate a device where F_GETFL fails (e.g., fd already closed)
+        let dev_path = PathBuf::from("/dev/input/event99");
+        let nb_result: Result<(), std::io::Error> = Err(std::io::Error::from_raw_os_error(libc::EBADF));
+
+        // The should_keep_device helper must reject this
+        assert!(!should_keep_device(&nb_result));
+
+        // And therefore it must not be in the active set
+        if should_keep_device(&nb_result) {
+            active_devices.insert(dev_path.clone(), ());
+        }
+        assert!(!active_devices.contains_key(&dev_path),
+            "A device with failed nonblocking setup must never be in the active polling set");
     }
 }

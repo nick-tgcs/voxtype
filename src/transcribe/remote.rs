@@ -32,6 +32,40 @@ pub struct RemoteTranscriber {
     timeout: Duration,
 }
 
+/// Parse a URL and check whether its host component is a loopback address.
+///
+/// Uses the `url` crate to correctly extract the hostname, which prevents
+/// userinfo-based bypasses (e.g. `http://localhost@evil.com` where the real
+/// host is `evil.com`, not `localhost`).
+///
+/// Returns `Ok(true)` for `localhost`, any address in 127.0.0.0/8, and `::1`.
+/// Returns `Ok(false)` for non-loopback hosts.
+/// Returns `Err` for malformed URLs (fails closed).
+fn host_is_loopback(url_str: &str) -> Result<bool, TranscribeError> {
+    let parsed = url::Url::parse(url_str).map_err(|e| {
+        TranscribeError::ConfigError(format!(
+            "remote_endpoint is not a valid URL: {} (error: {})",
+            url_str, e
+        ))
+    })?;
+
+    let host = parsed.host().ok_or_else(|| {
+        TranscribeError::ConfigError(format!(
+            "remote_endpoint has no host: {}",
+            url_str
+        ))
+    })?;
+
+    match host {
+        url::Host::Domain(domain) => {
+            // Exact match for "localhost" (case-insensitive)
+            Ok(domain.eq_ignore_ascii_case("localhost"))
+        }
+        url::Host::Ipv4(addr) => Ok(addr.is_loopback()),
+        url::Host::Ipv6(addr) => Ok(addr.is_loopback()),
+    }
+}
+
 impl RemoteTranscriber {
     /// Create a new remote transcriber from config
     pub fn new(config: &WhisperConfig) -> Result<Self, TranscribeError> {
@@ -53,15 +87,32 @@ impl RemoteTranscriber {
             )));
         }
 
-        // Warn about non-HTTPS for non-localhost endpoints
-        if endpoint.starts_with("http://")
-            && !endpoint.contains("localhost")
-            && !endpoint.contains("127.0.0.1")
-            && !endpoint.contains("[::1]")
-        {
-            tracing::warn!(
-                "Remote endpoint uses HTTP without TLS. Audio data will be transmitted unencrypted!"
-            );
+        // Reject non-loopback http:// unless explicitly opted in.
+        // http:// to loopback addresses (127.x.x.x / ::1 / localhost) is fine —
+        // traffic never leaves the machine. Non-loopback http:// sends audio
+        // (and any API key) in cleartext.
+        if endpoint.starts_with("http://") {
+            match host_is_loopback(&endpoint)? {
+                true => { /* loopback — allowed without opt-in */ }
+                false => {
+                    if config.remote_allow_insecure_http {
+                        tracing::warn!(
+                            "Remote endpoint uses HTTP over a non-loopback address. \
+                             Audio and API keys will be transmitted unencrypted. \
+                             Proceeding because remote_allow_insecure_http = true."
+                        );
+                    } else {
+                        return Err(TranscribeError::ConfigError(format!(
+                            "Remote endpoint '{}' uses HTTP over a non-loopback address. \
+                             Audio data would be transmitted unencrypted.\n\
+                             Use https:// instead, or set remote_allow_insecure_http = true \
+                             in your config (or --allow-insecure-http on the command line) \
+                             to accept this risk.",
+                            endpoint
+                        )));
+                    }
+                }
+            }
         }
 
         // Check for API key in config or environment
@@ -499,5 +550,271 @@ mod tests {
 
         let transcriber = RemoteTranscriber::new(&config).unwrap();
         assert_eq!(transcriber.timeout, Duration::from_secs(30));
+    }
+
+    // --- host_is_loopback unit tests ---
+
+    #[test]
+    fn test_loopback_localhost() {
+        assert!(host_is_loopback("http://localhost:8080").unwrap());
+        assert!(host_is_loopback("http://localhost").unwrap());
+        assert!(host_is_loopback("http://LOCALHOST:8080").unwrap());
+        assert!(host_is_loopback("https://localhost/v1/audio").unwrap());
+    }
+
+    #[test]
+    fn test_loopback_ipv4() {
+        assert!(host_is_loopback("http://127.0.0.1:8080").unwrap());
+        assert!(host_is_loopback("http://127.0.0.2:9000").unwrap());
+        assert!(host_is_loopback("http://127.1.2.3").unwrap());
+    }
+
+    #[test]
+    fn test_loopback_ipv6() {
+        assert!(host_is_loopback("http://[::1]:8080").unwrap());
+        assert!(host_is_loopback("http://[::1]").unwrap());
+    }
+
+    #[test]
+    fn test_not_loopback_remote_ip() {
+        assert!(!host_is_loopback("http://192.168.1.100:8080").unwrap());
+        assert!(!host_is_loopback("http://10.0.0.1").unwrap());
+        assert!(!host_is_loopback("http://8.8.8.8").unwrap());
+    }
+
+    #[test]
+    fn test_not_loopback_hostname() {
+        assert!(!host_is_loopback("http://example.com").unwrap());
+        assert!(!host_is_loopback("http://example.com:8080").unwrap());
+    }
+
+    #[test]
+    fn test_not_loopback_localhost_subdomain() {
+        // "localhost" must match the whole host, not as a substring
+        assert!(!host_is_loopback("http://localhost.example.com:8080").unwrap());
+        assert!(!host_is_loopback("http://notlocalhost.com").unwrap());
+    }
+
+    // --- userinfo bypass regression tests ---
+
+    #[test]
+    fn test_userinfo_bypass_localhost_at_evil() {
+        // http://localhost@evil.com — real host is evil.com, not localhost
+        assert!(!host_is_loopback("http://localhost@evil.com").unwrap());
+    }
+
+    #[test]
+    fn test_userinfo_bypass_localhost_port_at_evil() {
+        // http://localhost:8080@evil.com — "localhost:8080" is userinfo, host is evil.com
+        assert!(!host_is_loopback("http://localhost:8080@evil.com").unwrap());
+    }
+
+    #[test]
+    fn test_userinfo_bypass_127_at_evil() {
+        // http://127.0.0.1@evil.com — real host is evil.com
+        assert!(!host_is_loopback("http://127.0.0.1@evil.com").unwrap());
+    }
+
+    #[test]
+    fn test_userinfo_bypass_127_port_at_evil() {
+        // http://127.0.0.1:9000@evil.com — real host is evil.com
+        assert!(!host_is_loopback("http://127.0.0.1:9000@evil.com").unwrap());
+    }
+
+    // --- malformed URL tests ---
+
+    #[test]
+    fn test_malformed_url_fails_closed() {
+        // A URL with no host should fail (not default to loopback)
+        assert!(host_is_loopback("http://").is_err());
+        assert!(host_is_loopback("not-a-url").is_err());
+    }
+
+    // --- non-loopback HTTP rejection tests ---
+
+    #[test]
+    fn test_non_loopback_http_rejected_by_default() {
+        let config = WhisperConfig {
+            mode: Some(crate::config::WhisperMode::Remote),
+            remote_endpoint: Some("http://192.168.1.100:8080".to_string()),
+            remote_allow_insecure_http: false,
+            ..Default::default()
+        };
+        let result = RemoteTranscriber::new(&config);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("remote_allow_insecure_http"),
+            "error should mention the opt-in field: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_non_loopback_http_allowed_with_flag() {
+        let config = WhisperConfig {
+            mode: Some(crate::config::WhisperMode::Remote),
+            remote_endpoint: Some("http://192.168.1.100:8080".to_string()),
+            remote_allow_insecure_http: true,
+            ..Default::default()
+        };
+        // Should not return an error
+        assert!(RemoteTranscriber::new(&config).is_ok());
+    }
+
+    #[test]
+    fn test_https_non_loopback_always_allowed() {
+        let config = WhisperConfig {
+            mode: Some(crate::config::WhisperMode::Remote),
+            remote_endpoint: Some("https://api.openai.com".to_string()),
+            ..Default::default()
+        };
+        assert!(RemoteTranscriber::new(&config).is_ok());
+    }
+
+    #[test]
+    fn test_localhost_http_always_allowed() {
+        // Loopback http:// must never require the opt-in flag
+        for url in &[
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+        ] {
+            let config = WhisperConfig {
+                mode: Some(crate::config::WhisperMode::Remote),
+                remote_endpoint: Some(url.to_string()),
+                remote_allow_insecure_http: false,
+                ..Default::default()
+            };
+            assert!(
+                RemoteTranscriber::new(&config).is_ok(),
+                "loopback URL should be accepted without flag: {url}"
+            );
+        }
+    }
+
+    // --- integration-style tests for userinfo bypass ---
+
+    #[test]
+    fn test_userinfo_bypass_rejected_by_default() {
+        // http://localhost@evil.com must be treated as non-loopback
+        let config = WhisperConfig {
+            mode: Some(crate::config::WhisperMode::Remote),
+            remote_endpoint: Some("http://localhost@evil.com".to_string()),
+            remote_allow_insecure_http: false,
+            ..Default::default()
+        };
+        let result = RemoteTranscriber::new(&config);
+        assert!(result.is_err(), "userinfo bypass should be rejected by default");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("remote_allow_insecure_http"),
+            "error should mention the opt-in field: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_userinfo_bypass_with_port_rejected_by_default() {
+        // http://localhost:8080@evil.com must be treated as non-loopback
+        let config = WhisperConfig {
+            mode: Some(crate::config::WhisperMode::Remote),
+            remote_endpoint: Some("http://localhost:8080@evil.com".to_string()),
+            remote_allow_insecure_http: false,
+            ..Default::default()
+        };
+        let result = RemoteTranscriber::new(&config);
+        assert!(result.is_err(), "userinfo bypass with port should be rejected by default");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("remote_allow_insecure_http"),
+            "error should mention the opt-in field: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_userinfo_bypass_allowed_with_flag() {
+        // http://localhost@evil.com with opt-in should succeed
+        let config = WhisperConfig {
+            mode: Some(crate::config::WhisperMode::Remote),
+            remote_endpoint: Some("http://localhost@evil.com".to_string()),
+            remote_allow_insecure_http: true,
+            ..Default::default()
+        };
+        assert!(
+            RemoteTranscriber::new(&config).is_ok(),
+            "userinfo bypass should be allowed with opt-in flag"
+        );
+    }
+
+    #[test]
+    fn test_real_loopback_http_remains_allowed() {
+        // http://localhost:8080 (genuine loopback) must still work without the flag
+        let config = WhisperConfig {
+            mode: Some(crate::config::WhisperMode::Remote),
+            remote_endpoint: Some("http://localhost:8080".to_string()),
+            remote_allow_insecure_http: false,
+            ..Default::default()
+        };
+        assert!(
+            RemoteTranscriber::new(&config).is_ok(),
+            "real loopback should work without flag"
+        );
+    }
+
+    #[test]
+    fn test_real_loopback_ip_remains_allowed() {
+        // http://127.0.0.1:8080 (genuine loopback) must still work without the flag
+        let config = WhisperConfig {
+            mode: Some(crate::config::WhisperMode::Remote),
+            remote_endpoint: Some("http://127.0.0.1:8080".to_string()),
+            remote_allow_insecure_http: false,
+            ..Default::default()
+        };
+        assert!(
+            RemoteTranscriber::new(&config).is_ok(),
+            "real loopback IP should work without flag"
+        );
+    }
+
+    #[test]
+    fn test_non_loopback_http_remains_rejected() {
+        // http://192.168.1.100:8080 must still be rejected by default
+        let config = WhisperConfig {
+            mode: Some(crate::config::WhisperMode::Remote),
+            remote_endpoint: Some("http://192.168.1.100:8080".to_string()),
+            remote_allow_insecure_http: false,
+            ..Default::default()
+        };
+        assert!(RemoteTranscriber::new(&config).is_err());
+    }
+
+    #[test]
+    fn test_https_non_loopback_remains_allowed() {
+        // https://example.com must still be allowed without the flag
+        let config = WhisperConfig {
+            mode: Some(crate::config::WhisperMode::Remote),
+            remote_endpoint: Some("https://example.com".to_string()),
+            remote_allow_insecure_http: false,
+            ..Default::default()
+        };
+        assert!(RemoteTranscriber::new(&config).is_ok());
+    }
+
+    #[test]
+    fn test_malformed_endpoint_config_error() {
+        // A malformed URL should produce a clear config error, not be silently accepted
+        let config = WhisperConfig {
+            mode: Some(crate::config::WhisperMode::Remote),
+            remote_endpoint: Some("not-a-url".to_string()),
+            remote_allow_insecure_http: false,
+            ..Default::default()
+        };
+        let result = RemoteTranscriber::new(&config);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        // The error should mention the URL is invalid, not the insecure HTTP opt-in
+        assert!(
+            msg.contains("http://") || msg.contains("valid URL") || msg.contains("not a valid"),
+            "malformed URL error should describe the problem clearly: {msg}"
+        );
     }
 }

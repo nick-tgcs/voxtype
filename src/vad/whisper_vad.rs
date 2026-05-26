@@ -115,7 +115,10 @@ impl VoiceActivityDetector for WhisperVad {
     }
 }
 
-// WhisperVad is Send + Sync because the internal WhisperVadContext is wrapped in a Mutex
+// SAFETY: `WhisperVadContext` is not `Send` or `Sync` on its own (it holds a
+// raw pointer into whisper.cpp state), but `WhisperVad` wraps it in a `Mutex`,
+// which serialises all access. No reference to the inner context can escape the
+// `Mutex` guard, so concurrent use across threads is safe.
 unsafe impl Send for WhisperVad {}
 unsafe impl Sync for WhisperVad {}
 

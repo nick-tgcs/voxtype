@@ -4,6 +4,7 @@
 //! `voxtype setup onnx`/`voxtype setup parakeet` CLI.
 
 use super::binary::{self, EngineFamily, Variant};
+use crate::cuda_runtime::{self, DetectedCudaRuntimes};
 use std::path::Path;
 
 /// Parakeet backend variants exposed to existing callers (status formatting,
@@ -93,7 +94,17 @@ fn detect_current_whisper_variant() -> Option<Variant> {
 
 /// Pick the best ONNX variant for this system.
 fn detect_best_parakeet_backend() -> Option<ParakeetBackend> {
-    let inv = binary::inventory();
+    let host_cuda = detect_cuda_runtimes();
+    detect_best_parakeet_backend_for_inventory(&binary::inventory(), &host_cuda)
+}
+
+// Keep the mixed-install CUDA policy centralized here so `setup onnx --enable`,
+// `setup gpu --enable`, and the status path all make the same CUDA 12 vs 13
+// choice instead of each depending on local probe order.
+fn detect_best_parakeet_backend_for_inventory(
+    inv: &binary::Inventory,
+    host_cuda: &DetectedCudaRuntimes,
+) -> Option<ParakeetBackend> {
     let installed_onnx: Vec<&binary::VariantStatus> = inv
         .variants
         .iter()
@@ -106,20 +117,13 @@ fn detect_best_parakeet_backend() -> Option<ParakeetBackend> {
 
     // Prefer CUDA on NVIDIA hosts. cu12 vs cu13 binaries differ only in which
     // ONNX Runtime prebuilt they bundle (libcudart.so.12 vs .13); pick the one
-    // matching the host's runtime so the EP doesn't fail to register and
-    // silently fall back to CPU.
-    let host_cuda = detect_cuda_runtime_major();
-    let cuda_pref: &[Variant] = match host_cuda {
-        Some(13) => &[Variant::OnnxCuda13, Variant::OnnxCuda, Variant::OnnxCuda12],
-        Some(12) => &[Variant::OnnxCuda12, Variant::OnnxCuda, Variant::OnnxCuda13],
-        // Host CUDA detection failed; prefer cu13 since CUDA 13 is the
-        // rolling-distro default. Users on cu12 can override manually.
-        _ => &[Variant::OnnxCuda13, Variant::OnnxCuda12, Variant::OnnxCuda],
-    };
-    for v in cuda_pref {
-        if let Some(status) = installed_onnx.iter().find(|s| &s.variant == v) {
+    // matching one the host can run. Mixed 12/13 installs explicitly prefer
+    // the highest detected major; a no-detection fallback still prefers cu13
+    // first because that's the rolling-distro default.
+    for v in preferred_cuda_variant_order(host_cuda) {
+        if let Some(status) = installed_onnx.iter().find(|s| s.variant == v) {
             if status.runs_on_this_cpu && status.gpu_available {
-                return ParakeetBackend::from_variant(*v);
+                return ParakeetBackend::from_variant(v);
             }
         }
     }
@@ -144,40 +148,35 @@ fn detect_best_parakeet_backend() -> Option<ParakeetBackend> {
         .and_then(|s| ParakeetBackend::from_variant(s.variant))
 }
 
-/// Detect the host's CUDA runtime major version by dlopen'ing libcudart.
-/// Returns Some(12), Some(13), or None if CUDA isn't installed or the probe
-/// fails. Used by detect_best_parakeet_backend to pick between voxtype-onnx-cuda-12
-/// and voxtype-onnx-cuda-13 based on what the host can actually run.
+/// Ordered CUDA variant preference derived from the explicit setup policy.
+/// Mixed installs prefer the highest detected runtime major; no-detection still
+/// falls back to a stable documented order rather than whatever `dlopen` found.
+pub(crate) fn preferred_cuda_variant_order(host_cuda: &DetectedCudaRuntimes) -> [Variant; 3] {
+    match host_cuda.preferred_major() {
+        Some(13) => [Variant::OnnxCuda13, Variant::OnnxCuda, Variant::OnnxCuda12],
+        Some(12) => [Variant::OnnxCuda12, Variant::OnnxCuda, Variant::OnnxCuda13],
+        // Host CUDA detection failed entirely; prefer cu13 first as the
+        // rolling-distro default, then try cu12, then the generic legacy name.
+        _ => [Variant::OnnxCuda13, Variant::OnnxCuda12, Variant::OnnxCuda],
+    }
+}
+
+/// Detect all CUDA runtime majors the host can report via libcudart sonames.
+/// Mixed installs are returned as a set of majors; callers that need a single
+/// answer should use `preferred_major()`, which explicitly prefers the highest
+/// detected major rather than whichever soname happened to open first.
+pub(crate) fn detect_cuda_runtimes() -> DetectedCudaRuntimes {
+    let probes = cuda_runtime::probe_system_cuda_runtimes(cuda_runtime::setup_probe_candidates());
+    DetectedCudaRuntimes::from_probes(&probes)
+}
+
+/// Detect the host's preferred CUDA runtime major.
+///
+/// When both CUDA 12 and CUDA 13 are installed, setup explicitly prefers the
+/// highest detected major. When only the unversioned `libcudart.so` exists, the
+/// reported major from that library becomes the preference.
 pub fn detect_cuda_runtime_major() -> Option<i32> {
-    use std::ffi::CString;
-    let candidates = ["libcudart.so", "libcudart.so.13", "libcudart.so.12"];
-    let handle = candidates.iter().find_map(|name| {
-        let cstr = CString::new(*name).ok()?;
-        let h = unsafe { libc::dlopen(cstr.as_ptr(), libc::RTLD_LAZY) };
-        if h.is_null() {
-            None
-        } else {
-            Some(h)
-        }
-    })?;
-
-    let sym_name = CString::new("cudaRuntimeGetVersion").ok()?;
-    let sym = unsafe { libc::dlsym(handle, sym_name.as_ptr()) };
-    if sym.is_null() {
-        unsafe { libc::dlclose(handle) };
-        return None;
-    }
-
-    type CudaRuntimeGetVersion = unsafe extern "C" fn(*mut i32) -> i32;
-    let get_version: CudaRuntimeGetVersion = unsafe { std::mem::transmute(sym) };
-    let mut version: i32 = 0;
-    let result = unsafe { get_version(&mut version) };
-    unsafe { libc::dlclose(handle) };
-
-    if result != 0 {
-        return None;
-    }
-    Some(version / 1000)
+    detect_cuda_runtimes().preferred_major()
 }
 
 pub fn show_status() {
@@ -355,6 +354,59 @@ pub fn disable() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::setup::binary::{Cpu, Gpus, InstallKind, Recommendation, VariantStatus};
+    use std::path::PathBuf;
+
+    fn detected_runtimes(majors: &[i32]) -> DetectedCudaRuntimes {
+        let probes = majors
+            .iter()
+            .map(|major| cuda_runtime::ProbedCudaRuntime {
+                candidate: cuda_runtime::runtime_probe_candidates(*major)[0],
+                result: cuda_runtime::CudaRuntimeProbeResult::Detected {
+                    version: major * 1000,
+                },
+            })
+            .collect::<Vec<_>>();
+        DetectedCudaRuntimes::from_probes(&probes)
+    }
+
+    fn inventory_with_installed(installed: &[Variant]) -> binary::Inventory {
+        let cpu = Cpu {
+            avx2: true,
+            avx512: true,
+        };
+        let gpus = Gpus {
+            nvidia: true,
+            amd: false,
+        };
+        binary::Inventory {
+            install_kind: InstallKind::Package,
+            binary_path: PathBuf::from("/usr/bin/voxtype"),
+            package_lib_dir: Some(PathBuf::from(binary::LIB_DIR)),
+            active_variant: None,
+            variants: Variant::ALL
+                .iter()
+                .map(|variant| VariantStatus {
+                    variant: *variant,
+                    binary_name: variant.binary_name().to_string(),
+                    installed: installed.contains(variant),
+                    runs_on_this_cpu: true,
+                    gpu_available: true,
+                    active: false,
+                })
+                .collect(),
+            cpu: cpu.clone(),
+            gpus: gpus.clone(),
+            compiled_features: vec![],
+            recommendation: Recommendation {
+                whisper: Variant::WhisperVulkan,
+                whisper_reason: "test",
+                onnx: Variant::OnnxCuda13,
+                onnx_reason: "test",
+                primary: Variant::WhisperVulkan,
+            },
+        }
+    }
 
     #[test]
     fn parakeet_backend_round_trip() {
@@ -438,5 +490,37 @@ mod tests {
         let backend = ParakeetBackend::Cuda12;
         let cloned = backend;
         assert_eq!(backend, cloned);
+    }
+
+    #[test]
+    fn mixed_cuda_hosts_explicitly_prefer_cuda_13() {
+        let detected = detected_runtimes(&[12, 13]);
+
+        assert_eq!(
+            preferred_cuda_variant_order(&detected)[0],
+            Variant::OnnxCuda13
+        );
+    }
+
+    #[test]
+    fn backend_selection_uses_explicit_mixed_install_policy() {
+        let inventory = inventory_with_installed(&[Variant::OnnxCuda12, Variant::OnnxCuda13]);
+        let detected = detected_runtimes(&[12, 13]);
+
+        assert_eq!(
+            detect_best_parakeet_backend_for_inventory(&inventory, &detected),
+            Some(ParakeetBackend::Cuda13)
+        );
+    }
+
+    #[test]
+    fn backend_selection_falls_back_when_preferred_cuda_variant_is_missing() {
+        let inventory = inventory_with_installed(&[Variant::OnnxCuda12]);
+        let detected = detected_runtimes(&[12, 13]);
+
+        assert_eq!(
+            detect_best_parakeet_backend_for_inventory(&inventory, &detected),
+            Some(ParakeetBackend::Cuda12)
+        );
     }
 }

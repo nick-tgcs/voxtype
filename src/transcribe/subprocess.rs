@@ -182,6 +182,10 @@ impl SubprocessTranscriber {
         })?;
 
         // Write samples (f32 little-endian)
+        // SAFETY: `samples` is a valid, aligned slice of `f32`. Reinterpreting
+        // its bytes as `u8` for I/O is safe: the pointer is valid, the byte
+        // length is computed from `size_of_val`, and the resulting slice is
+        // only used for a single `write_all` call within this scope.
         let samples_bytes = unsafe {
             std::slice::from_raw_parts(
                 samples.as_ptr() as *const u8,

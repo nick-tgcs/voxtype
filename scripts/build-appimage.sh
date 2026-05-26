@@ -18,6 +18,127 @@
 
 set -euo pipefail
 
+# ---------------------------------------------------------------------------
+# Pinned appimagetool release
+# To update: download the new release, run sha256sum on it, and update both
+# constants below. The URL must contain the version string.
+#
+# To skip verification (not recommended — you accept the risk):
+#   APPIMAGETOOL_SKIP_VERIFY=1 ./scripts/build-appimage.sh VERSION
+# To allow an unpinned system appimagetool only if the pinned artifact cannot
+# be reused or downloaded (not recommended — bypasses version pinning and
+# SHA-256 verification):
+#   APPIMAGETOOL_ALLOW_SYSTEM=1 ./scripts/build-appimage.sh VERSION
+# ---------------------------------------------------------------------------
+APPIMAGETOOL_VERSION="1.9.1"
+APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage"
+
+# ---------------------------------------------------------------------------
+# verify_download_sha256 is defined before the source guard so that tests can
+# source this script (with APPIMAGETOOL_SOURCE_ONLY=1) and call it directly.
+# ---------------------------------------------------------------------------
+
+# Verify the SHA-256 of a downloaded file against an expected hex string.
+#
+# Usage: verify_download_sha256 FILE EXPECTED_HEX
+# Returns 0 on match. On mismatch: prints an error to stderr showing the
+# actual hash, deletes FILE, and returns 1.
+# Comparison is case-insensitive.
+verify_download_sha256() {
+    local file="$1" expected="$2"
+
+    if [[ -z "$expected" ]]; then
+        echo "  Error: expected SHA-256 is empty" >&2
+        return 1
+    fi
+
+    if [[ ! -f "$file" ]]; then
+        echo "  Error: file not found: $file" >&2
+        return 1
+    fi
+
+    local actual
+    actual=$(sha256sum "$file" | cut -d' ' -f1)
+
+    if [[ "${actual,,}" != "${expected,,}" ]]; then
+        echo "  SHA-256 mismatch for $(basename "$file")" >&2
+        echo "    expected: ${expected,,}" >&2
+        echo "    computed: $actual" >&2
+        echo "  To skip verification (not recommended): set APPIMAGETOOL_SKIP_VERIFY=1" >&2
+        rm -f "$file"
+        return 1
+    fi
+}
+
+# Find or download appimagetool, pinned to APPIMAGETOOL_VERSION.
+#
+# Resolution order:
+#   1. Cached versioned binary    — verified against pinned SHA-256 on each use.
+#   2. Fresh download             — verified before chmod +x or use.
+#   3. Optional system fallback   — only when APPIMAGETOOL_ALLOW_SYSTEM=1;
+#                                    bypasses the pinned version and verification.
+#
+# Set APPIMAGETOOL_SKIP_VERIFY=1 to bypass hash checking (accepts the risk).
+find_appimagetool() {
+    local cache_dir="$HOME/.local/bin"
+    local cached="$cache_dir/appimagetool-${APPIMAGETOOL_VERSION}"
+
+    # 1. Already cached — verify before reusing
+    if [[ -x "$cached" ]]; then
+        if [[ -n "${APPIMAGETOOL_SKIP_VERIFY:-}" ]]; then
+            echo "  Warning: SHA-256 verification skipped (APPIMAGETOOL_SKIP_VERIFY is set)" >&2
+            echo "$cached"
+            return
+        fi
+        if verify_download_sha256 "$cached" "$APPIMAGETOOL_SHA256" 2>/dev/null; then
+            echo "$cached"
+            return
+        fi
+        echo "  Cached appimagetool failed verification; re-downloading..." >&2
+        # verify_download_sha256 already deleted the corrupted cache file
+    fi
+
+    # 2. Download to a temp file, verify, then move into place
+    echo "  Downloading appimagetool ${APPIMAGETOOL_VERSION}..." >&2
+    mkdir -p "$cache_dir"
+    local tmp
+    tmp=$(mktemp "${cache_dir}/appimagetool-${APPIMAGETOOL_VERSION}.XXXXXX")
+
+    if ! curl -fsSL -o "$tmp" "$APPIMAGETOOL_URL"; then
+        rm -f "$tmp"
+        echo "  Error: failed to download pinned appimagetool ${APPIMAGETOOL_VERSION}" >&2
+        if [[ -n "${APPIMAGETOOL_ALLOW_SYSTEM:-}" ]] && command -v appimagetool >/dev/null 2>&1; then
+            echo "  Warning: using system appimagetool from PATH because APPIMAGETOOL_ALLOW_SYSTEM is set" >&2
+            echo "  Warning: this bypasses the pinned version and SHA-256 verification" >&2
+            echo "appimagetool"
+            return 0
+        fi
+        return 1
+    fi
+
+    if [[ -z "${APPIMAGETOOL_SKIP_VERIFY:-}" ]]; then
+        if ! verify_download_sha256 "$tmp" "$APPIMAGETOOL_SHA256"; then
+            # verify_download_sha256 already deleted the temp file
+            echo "  Download aborted: SHA-256 verification failed." >&2
+            echo "  Update APPIMAGETOOL_VERSION and APPIMAGETOOL_SHA256 in this script" >&2
+            echo "  if appimagetool has been updated, or set APPIMAGETOOL_SKIP_VERIFY=1" >&2
+            echo "  to bypass (not recommended)." >&2
+            return 1
+        fi
+    else
+        echo "  Warning: SHA-256 verification skipped (APPIMAGETOOL_SKIP_VERIFY is set)" >&2
+    fi
+
+    mv "$tmp" "$cached"
+    chmod +x "$cached"
+    echo "$cached"
+}
+
+# Allow sourcing this script to load functions without executing the build.
+# Used by tests/test-build-appimage-verify.sh.
+[[ -n "${APPIMAGETOOL_SOURCE_ONLY:-}" ]] && return 0
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -40,7 +161,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Variants: whisper, onnx, onnx-cuda, all"
             echo ""
-            echo "Requires appimagetool (auto-downloaded if missing)"
+            echo "Uses pinned appimagetool (auto-downloaded and SHA-256 verified by default)"
             exit 0
             ;;
         *)
@@ -64,27 +185,6 @@ if [[ ! -d "$RELEASE_DIR" ]]; then
     echo "Build binaries first or check the version number." >&2
     exit 1
 fi
-
-# Find or download appimagetool
-find_appimagetool() {
-    if command -v appimagetool >/dev/null 2>&1; then
-        echo "appimagetool"
-        return
-    fi
-
-    local cached="$HOME/.local/bin/appimagetool"
-    if [[ -x "$cached" ]]; then
-        echo "$cached"
-        return
-    fi
-
-    echo "  Downloading appimagetool..." >&2
-    mkdir -p "$HOME/.local/bin"
-    curl -fsSL -o "$cached" \
-        "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
-    chmod +x "$cached"
-    echo "$cached"
-}
 
 APPIMAGETOOL="$(find_appimagetool)"
 echo "Using appimagetool: $APPIMAGETOOL"

@@ -133,6 +133,11 @@ pub fn run_worker(config: &WhisperConfig) -> anyhow::Result<()> {
 
     // Read samples (f32 little-endian)
     let mut samples = vec![0f32; sample_count];
+    // SAFETY: `samples` is a freshly allocated, properly aligned `Vec<f32>`.
+    // Reinterpreting its backing memory as `u8` for `read_exact` is safe:
+    // the pointer is valid and exclusively owned, the byte length matches
+    // `sample_count * size_of::<f32>()`, and no other reference to `samples`
+    // exists until the slice is dropped at the end of this block.
     let samples_bytes = unsafe {
         std::slice::from_raw_parts_mut(
             samples.as_mut_ptr() as *mut u8,

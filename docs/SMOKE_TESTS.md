@@ -564,7 +564,12 @@ voxtype setup model small.en
 # 1. Configure remote backend in config.toml:
 #    [whisper]
 #    backend = "remote"
-#    remote_endpoint = "http://your-server:8080"
+#    remote_endpoint = "http://127.0.0.1:8080"
+#    # or, for a remote server with TLS:
+#    # remote_endpoint = "https://whisper.example.internal"
+#    # or, if you intentionally use cleartext HTTP on a trusted LAN:
+#    # remote_endpoint = "http://your-server:8080"
+#    # remote_allow_insecure_http = true
 
 # 2. Restart and test
 systemctl --user restart voxtype

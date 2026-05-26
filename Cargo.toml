@@ -50,6 +50,9 @@ hound = "3"  # WAV file reading/writing
 # HTTP client for remote transcription
 ureq = { version = "2", features = ["json"] }
 
+# URL parsing for remote endpoint validation
+url = "2"
+
 # WebSocket client for Soniox streaming backend (optional)
 tokio-tungstenite = { version = "0.24", optional = true, features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", optional = true }
@@ -58,6 +61,9 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
 
 # JSON parsing (for CLI backend)
 serde_json = "1"
+
+# SHA-256 for model download integrity verification
+sha2 = "0.10"
 
 # Version comparison for update checking
 semver = "1"

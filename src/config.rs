@@ -979,6 +979,12 @@ pub struct WhisperConfig {
     #[serde(default)]
     pub remote_timeout_secs: Option<u64>,
 
+    /// Allow non-loopback HTTP endpoints for remote transcription (not recommended).
+    /// When false (default), non-loopback http:// endpoints are rejected at startup.
+    /// Set to true to accept the risk of sending audio over a cleartext connection.
+    #[serde(default)]
+    pub remote_allow_insecure_http: bool,
+
     // --- CLI backend settings ---
     /// Path to whisper-cli binary (optional, searches PATH if not set)
     /// Used when mode = "cli"
@@ -1041,6 +1047,7 @@ impl Default for WhisperConfig {
             remote_model: None,
             remote_api_key: None,
             remote_timeout_secs: None,
+            remote_allow_insecure_http: false,
             whisper_cli_path: None,
         }
     }
@@ -2248,6 +2255,7 @@ impl Default for Config {
                 remote_model: None,
                 remote_api_key: None,
                 remote_timeout_secs: None,
+                remote_allow_insecure_http: false,
                 whisper_cli_path: None,
             },
             output: OutputConfig {
@@ -2717,6 +2725,9 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
     }
     if let Ok(key) = std::env::var("VOXTYPE_WHISPER_API_KEY") {
         config.whisper.remote_api_key = Some(key);
+    }
+    if let Ok(val) = std::env::var("VOXTYPE_ALLOW_INSECURE_HTTP") {
+        config.whisper.remote_allow_insecure_http = parse_bool_env(&val);
     }
 
     // Soniox
@@ -4497,6 +4508,198 @@ mod tests {
         assert_eq!(
             config.output.language_to_layout.get("en"),
             Some(&"dvorak".to_string())
+        );
+    }
+
+    // =========================================================================
+    // VOXTYPE_ALLOW_INSECURE_HTTP env-var override tests
+    // =========================================================================
+
+    #[test]
+    fn test_allow_insecure_http_default_false() {
+        // Default config has the field as false.
+        let config = Config::default();
+        assert!(!config.whisper.remote_allow_insecure_http);
+    }
+
+    #[test]
+    fn test_allow_insecure_http_config_file_true_no_env() {
+        // Config-file true, env absent -> true preserved.
+        let _guard = crate::test_env::EnvGuard::remove("VOXTYPE_ALLOW_INSECURE_HTTP");
+        let mut config = Config::default();
+        config.whisper.remote_allow_insecure_http = true;
+        // Simulate what load_config does after file parsing.
+        if let Ok(val) = std::env::var("VOXTYPE_ALLOW_INSECURE_HTTP") {
+            config.whisper.remote_allow_insecure_http = parse_bool_env(&val);
+        }
+        assert!(config.whisper.remote_allow_insecure_http);
+    }
+
+    #[test]
+    fn test_allow_insecure_http_config_file_false_no_env() {
+        // Config-file false, env absent -> false preserved.
+        let _guard = crate::test_env::EnvGuard::remove("VOXTYPE_ALLOW_INSECURE_HTTP");
+        let mut config = Config::default();
+        config.whisper.remote_allow_insecure_http = false;
+        if let Ok(val) = std::env::var("VOXTYPE_ALLOW_INSECURE_HTTP") {
+            config.whisper.remote_allow_insecure_http = parse_bool_env(&val);
+        }
+        assert!(!config.whisper.remote_allow_insecure_http);
+    }
+
+    #[test]
+    fn test_allow_insecure_http_env_1_enables() {
+        // env = "1" -> true, regardless of config-file value.
+        let _guard = crate::test_env::EnvGuard::set("VOXTYPE_ALLOW_INSECURE_HTTP", "1");
+        let mut config = Config::default(); // default false
+        if let Ok(val) = std::env::var("VOXTYPE_ALLOW_INSECURE_HTTP") {
+            config.whisper.remote_allow_insecure_http = parse_bool_env(&val);
+        }
+        assert!(config.whisper.remote_allow_insecure_http);
+    }
+
+    #[test]
+    fn test_allow_insecure_http_env_true_enables() {
+        // env = "true" -> true.
+        let _guard = crate::test_env::EnvGuard::set("VOXTYPE_ALLOW_INSECURE_HTTP", "true");
+        let mut config = Config::default();
+        if let Ok(val) = std::env::var("VOXTYPE_ALLOW_INSECURE_HTTP") {
+            config.whisper.remote_allow_insecure_http = parse_bool_env(&val);
+        }
+        assert!(config.whisper.remote_allow_insecure_http);
+    }
+
+    #[test]
+    fn test_allow_insecure_http_env_0_disables() {
+        // env = "0" overrides config-file true -> false.
+        let _guard = crate::test_env::EnvGuard::set("VOXTYPE_ALLOW_INSECURE_HTTP", "0");
+        let mut config = Config::default();
+        config.whisper.remote_allow_insecure_http = true; // simulate config-file
+        if let Ok(val) = std::env::var("VOXTYPE_ALLOW_INSECURE_HTTP") {
+            config.whisper.remote_allow_insecure_http = parse_bool_env(&val);
+        }
+        assert!(!config.whisper.remote_allow_insecure_http);
+    }
+
+    #[test]
+    fn test_allow_insecure_http_env_false_disables() {
+        // env = "false" overrides config-file true -> false.
+        let _guard = crate::test_env::EnvGuard::set("VOXTYPE_ALLOW_INSECURE_HTTP", "false");
+        let mut config = Config::default();
+        config.whisper.remote_allow_insecure_http = true;
+        if let Ok(val) = std::env::var("VOXTYPE_ALLOW_INSECURE_HTTP") {
+            config.whisper.remote_allow_insecure_http = parse_bool_env(&val);
+        }
+        assert!(!config.whisper.remote_allow_insecure_http);
+    }
+
+    #[test]
+    fn test_allow_insecure_http_integration_env_0_overrides_config_file_true() {
+        // Integration: full load_config() path with a real file on disk.
+        // Config file sets true; env "0" must force false.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mut f = std::fs::File::create(&config_path).unwrap();
+        writeln!(
+            f,
+            r#"
+[hotkey]
+key = "SCROLLLOCK"
+
+[audio]
+device = "default"
+sample_rate = 16000
+max_duration_secs = 30
+
+[whisper]
+model = "base.en"
+remote_allow_insecure_http = true
+
+[output]
+mode = "type"
+"#
+        )
+        .unwrap();
+
+        let _guard = crate::test_env::EnvGuard::set("VOXTYPE_ALLOW_INSECURE_HTTP", "0");
+        let config = load_config(Some(&config_path)).unwrap();
+        assert!(
+            !config.whisper.remote_allow_insecure_http,
+            "env=0 must override config-file true"
+        );
+    }
+
+    #[test]
+    fn test_allow_insecure_http_integration_env_1_overrides_config_file_false() {
+        // Integration: full load_config() path with a real file on disk.
+        // Config file sets false; env "1" must force true.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mut f = std::fs::File::create(&config_path).unwrap();
+        writeln!(
+            f,
+            r#"
+[hotkey]
+key = "SCROLLLOCK"
+
+[audio]
+device = "default"
+sample_rate = 16000
+max_duration_secs = 30
+
+[whisper]
+model = "base.en"
+remote_allow_insecure_http = false
+
+[output]
+mode = "type"
+"#
+        )
+        .unwrap();
+
+        let _guard = crate::test_env::EnvGuard::set("VOXTYPE_ALLOW_INSECURE_HTTP", "1");
+        let config = load_config(Some(&config_path)).unwrap();
+        assert!(
+            config.whisper.remote_allow_insecure_http,
+            "env=1 must override config-file false"
+        );
+    }
+
+    #[test]
+    fn test_allow_insecure_http_integration_no_env_preserves_config_file() {
+        // Integration: no env var -> config-file value is used as-is.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mut f = std::fs::File::create(&config_path).unwrap();
+        writeln!(
+            f,
+            r#"
+[hotkey]
+key = "SCROLLLOCK"
+
+[audio]
+device = "default"
+sample_rate = 16000
+max_duration_secs = 30
+
+[whisper]
+model = "base.en"
+remote_allow_insecure_http = true
+
+[output]
+mode = "type"
+"#
+        )
+        .unwrap();
+
+        let _guard = crate::test_env::EnvGuard::remove("VOXTYPE_ALLOW_INSECURE_HTTP");
+        let config = load_config(Some(&config_path)).unwrap();
+        assert!(
+            config.whisper.remote_allow_insecure_http,
+            "absent env must preserve config-file value"
         );
     }
 }

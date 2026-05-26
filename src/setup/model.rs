@@ -2,7 +2,13 @@
 
 use super::{print_failure, print_info, print_success, print_warning};
 use crate::config::{Config, TranscriptionEngine};
+use crate::setup::verify::{
+    ensure_file_integrity, ensure_file_integrity_with_prompt, fetch_hf_lfs_sha256,
+    prompt_hash_mismatch_continue, CanonicalHashStatus, IntegrityContext, IntegrityOutcome,
+    IntegrityPromptCache,
+};
 use crate::transcribe::whisper::{get_model_filename, get_model_url};
+use anyhow::Context;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
@@ -1256,6 +1262,279 @@ async fn restart_daemon_if_running() {
 // Whisper Download Functions
 // =============================================================================
 
+struct RuntimeHelperAssetSpec {
+    filename: &'static str,
+    url: &'static str,
+    sha256: &'static str,
+    download_message: &'static str,
+    success_message: &'static str,
+    download_failure_message: &'static str,
+    curl_missing_message: &'static str,
+}
+
+fn curl_download(path: &Path, url: &str, show_progress: bool) -> anyhow::Result<()> {
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("File path contains non-UTF-8 bytes: {:?}", path))?;
+
+    let mut args = vec!["-L"];
+    if show_progress {
+        args.push("--progress-bar");
+    } else {
+        args.push("-sS");
+    }
+    args.extend(["-o", path_str, url]);
+
+    match Command::new("curl").args(&args).status() {
+        Ok(exit_status) if exit_status.success() => Ok(()),
+        Ok(exit_status) => {
+            let _ = std::fs::remove_file(path);
+            anyhow::bail!(
+                "Download failed: curl exited with code {}",
+                exit_status.code().unwrap_or(-1)
+            )
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(path);
+            anyhow::bail!(
+                "curl not available: {}. Please ensure curl is installed (e.g., 'sudo pacman -S curl')",
+                e
+            )
+        }
+    }
+}
+
+/// Fetch the canonical hash status for a model file from HuggingFace metadata.
+///
+/// Returns `Ok(CanonicalHashStatus::KnownHash(hex))` when the file is found
+/// and has an LFS SHA-256 that callers should verify against.
+///
+/// Returns `Ok(CanonicalHashStatus::NoCanonicalHash)` when the file is found
+/// in metadata but is stored inline with no LFS hash (e.g. small config files).
+///
+/// Returns `Err` on network failure, parse failure, or when the file is not
+/// listed in the repository metadata at all. **Callers must propagate this
+/// error** — silently treating it as `None` would downgrade a strict explicit
+/// setup flow into an unverified success path.
+fn fetch_hf_expected_hash(
+    repo: &str,
+    remote_filename: &str,
+    display_name: &str,
+) -> anyhow::Result<CanonicalHashStatus> {
+    fetch_hf_lfs_sha256(repo, remote_filename).with_context(|| {
+        format!(
+            "Failed to look up canonical hash for '{}' in HuggingFace repo '{}'",
+            display_name, repo
+        )
+    })
+}
+
+/// Convert a `CanonicalHashStatus` to the `Option<&str>` form expected by
+/// the integrity engine.
+///
+/// - `KnownHash` → `Some(hex)` — the engine will verify the file against
+///   this hash and repair/prompt on mismatch.
+/// - `NoCanonicalHash` → `None` — the engine accepts the file as-is; this
+///   is intentional for inline HF files that genuinely have no LFS hash.
+///
+/// This must only be called after `fetch_hf_expected_hash` has already
+/// succeeded. The absence of a hash here means "metadata fetch succeeded
+/// and the file truly has no canonical hash", not "lookup failed".
+fn resolve_hash_status(status: &CanonicalHashStatus) -> Option<&str> {
+    match status {
+        CanonicalHashStatus::KnownHash(h) => Some(h.as_str()),
+        CanonicalHashStatus::NoCanonicalHash => None,
+    }
+}
+
+/// Fetch the canonical hash for a file and run integrity-gated download.
+///
+/// This is the per-file building block used by all model downloaders.
+/// The injected `hash_fetcher(repo, repo_path)` returns a `CanonicalHashStatus`
+/// or an error; in production code it wraps `fetch_hf_lfs_sha256`, and in
+/// tests a stub can be injected to avoid network calls.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn ensure_model_file_with_fetcher<H, D>(
+    file_path: &std::path::Path,
+    repo: &str,
+    repo_path: &str,
+    local_filename: &str,
+    prompt_cache: &mut IntegrityPromptCache,
+    hash_fetcher: H,
+    download_file: D,
+) -> anyhow::Result<IntegrityOutcome>
+where
+    H: FnOnce(&str, &str) -> anyhow::Result<CanonicalHashStatus>,
+    D: FnMut() -> anyhow::Result<()>,
+{
+    use anyhow::Context;
+    let hash_status = hash_fetcher(repo, repo_path).with_context(|| {
+        format!(
+            "Failed to look up canonical hash for '{}' from HuggingFace",
+            local_filename
+        )
+    })?;
+    let expected_hash = resolve_hash_status(&hash_status);
+    ensure_setup_file(file_path, expected_hash, prompt_cache, download_file)
+}
+
+fn ensure_setup_file<F>(
+    file_path: &Path,
+    expected_hash: Option<&str>,
+    prompt_cache: &mut IntegrityPromptCache,
+    download_file: F,
+) -> anyhow::Result<IntegrityOutcome>
+where
+    F: FnMut() -> anyhow::Result<()>,
+{
+    ensure_setup_file_with_prompt(
+        file_path,
+        expected_hash,
+        prompt_cache,
+        download_file,
+        prompt_hash_mismatch_continue,
+    )
+}
+
+fn ensure_setup_file_with_prompt<F, P>(
+    file_path: &Path,
+    expected_hash: Option<&str>,
+    prompt_cache: &mut IntegrityPromptCache,
+    download_file: F,
+    prompt: P,
+) -> anyhow::Result<IntegrityOutcome>
+where
+    F: FnMut() -> anyhow::Result<()>,
+    P: FnMut(&Path, &anyhow::Error) -> bool,
+{
+    ensure_file_integrity_with_prompt(
+        file_path,
+        expected_hash,
+        IntegrityContext::ExplicitSetup,
+        prompt_cache,
+        download_file,
+        prompt,
+    )
+}
+
+/// Classification of a file's setup integrity outcome, used by
+/// [`report_setup_outcome`] and by unit tests to assert reporting behaviour
+/// without capturing stdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetupOutcomeKind {
+    /// File already exists and was verified against its canonical hash.
+    AlreadyVerified,
+    /// File already exists; no canonical hash was available to verify it.
+    AlreadyCachedNoHash,
+    /// File had a hash mismatch, was re-downloaded, and is now verified.
+    Repaired,
+    /// Integrity verification persistently failed; the user chose to keep the
+    /// file. The file is retained but must **not** be treated as verified.
+    AcceptedByUserUnverified,
+    /// File was freshly downloaded and verified (normal success path).
+    Downloaded,
+    /// Any other outcome that requires no per-file message.
+    Other,
+}
+
+/// Map an [`IntegrityOutcome`] to a [`SetupOutcomeKind`] for reporting.
+///
+/// This is a pure function with no side effects, making it directly testable
+/// without stdout capture.
+pub(crate) fn classify_outcome(outcome: IntegrityOutcome) -> SetupOutcomeKind {
+    match outcome {
+        IntegrityOutcome::ReusedVerified => SetupOutcomeKind::AlreadyVerified,
+        IntegrityOutcome::ReusedWithoutHash => SetupOutcomeKind::AlreadyCachedNoHash,
+        IntegrityOutcome::Repaired => SetupOutcomeKind::Repaired,
+        IntegrityOutcome::AcceptedByUser => SetupOutcomeKind::AcceptedByUserUnverified,
+        IntegrityOutcome::DownloadedVerified => SetupOutcomeKind::Downloaded,
+        _ => SetupOutcomeKind::Other,
+    }
+}
+
+fn report_setup_outcome(label: &str, outcome: IntegrityOutcome) {
+    match classify_outcome(outcome) {
+        SetupOutcomeKind::AlreadyVerified => {
+            println!("  {} already exists, verified", label);
+        }
+        SetupOutcomeKind::AlreadyCachedNoHash => {
+            println!(
+                "  {} already exists, reusing cached copy (no canonical hash metadata available)",
+                label
+            );
+        }
+        SetupOutcomeKind::Repaired => {
+            println!(
+                "  {} failed integrity verification and was re-downloaded",
+                label
+            );
+        }
+        SetupOutcomeKind::AcceptedByUserUnverified => {
+            print_warning(&format!(
+                "{}: integrity verification failed; file kept only because you chose to \
+                 continue - treat as unverified",
+                label
+            ));
+        }
+        SetupOutcomeKind::Downloaded | SetupOutcomeKind::Other => {}
+    }
+}
+
+fn ensure_runtime_helper_asset_with<F>(
+    models_dir: &Path,
+    spec: &RuntimeHelperAssetSpec,
+    mut download_file: F,
+) -> Option<std::path::PathBuf>
+where
+    F: FnMut(&Path, &str, bool) -> anyhow::Result<()>,
+{
+    let model_path = models_dir.join(spec.filename);
+    let had_cached_file = model_path.exists();
+
+    if let Err(e) = std::fs::create_dir_all(models_dir) {
+        eprintln!("Warning: Could not create models directory: {}", e);
+        return None;
+    }
+
+    if !had_cached_file {
+        println!("{}", spec.download_message);
+    }
+
+    let mut prompt_cache = IntegrityPromptCache::default();
+    let mut first_download = true;
+
+    match ensure_file_integrity(
+        &model_path,
+        Some(spec.sha256),
+        IntegrityContext::RuntimeHelperAsset,
+        &mut prompt_cache,
+        || {
+            let show_progress = !had_cached_file && first_download;
+            first_download = false;
+            download_file(&model_path, spec.url, show_progress)
+        },
+    ) {
+        Ok(IntegrityOutcome::Fallback) => None,
+        Ok(_) => {
+            if !had_cached_file {
+                println!("{}", spec.success_message);
+            }
+            Some(model_path)
+        }
+        Err(e) => {
+            if !had_cached_file {
+                if e.to_string().contains("curl not available") {
+                    eprintln!("{}", spec.curl_missing_message);
+                } else {
+                    eprintln!("{}", spec.download_failure_message);
+                }
+            }
+            let _ = std::fs::remove_file(&model_path);
+            None
+        }
+    }
+}
+
 /// Download a specific Whisper model using curl
 pub fn download_model(model_name: &str) -> anyhow::Result<()> {
     let models_dir = Config::models_dir();
@@ -1266,141 +1545,99 @@ pub fn download_model(model_name: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all(&models_dir)?;
 
     let url = get_model_url(model_name);
+    let hash_status = fetch_hf_expected_hash("ggerganov/whisper.cpp", &filename, &filename)?;
+    let expected_hash = resolve_hash_status(&hash_status);
+    let mut prompt_cache = IntegrityPromptCache::default();
+    let mut announced_download = false;
 
-    println!("\nDownloading {}...", model_name);
-    println!("URL: {}", url);
-
-    // Use curl for downloading - it handles progress display and redirects
-    let status = Command::new("curl")
-        .args([
-            "-L",             // Follow redirects
-            "--progress-bar", // Show progress bar
-            "-o",
-            model_path.to_str().unwrap_or("model.bin"),
-            &url,
-        ])
-        .status();
-
-    match status {
-        Ok(exit_status) if exit_status.success() => {
-            print_success(&format!("Saved to {:?}", model_path));
-            Ok(())
+    let outcome = ensure_setup_file(&model_path, expected_hash, &mut prompt_cache, || {
+        if !announced_download {
+            println!("\nDownloading {}...", model_name);
+            println!("URL: {}", url);
+            announced_download = true;
         }
-        Ok(exit_status) => {
-            print_failure(&format!(
-                "Download failed: curl exited with code {}",
-                exit_status.code().unwrap_or(-1)
+        curl_download(&model_path, &url, true)
+    })?;
+
+    match outcome {
+        IntegrityOutcome::ReusedVerified => {
+            print_success(&format!(
+                "Model already installed and verified: {:?}",
+                model_path
             ));
-            // Clean up partial download
-            let _ = std::fs::remove_file(&model_path);
-            anyhow::bail!("Download failed")
         }
-        Err(e) => {
-            print_failure(&format!("Failed to run curl: {}", e));
-            print_info("Please ensure curl is installed (e.g., 'sudo pacman -S curl')");
-            anyhow::bail!("curl not available: {}", e)
+        IntegrityOutcome::ReusedWithoutHash => {
+            print_success(&format!("Model already installed: {:?}", model_path));
+            print_warning("No canonical SHA-256 metadata was available for this cached file.");
+        }
+        IntegrityOutcome::AcceptedByUser => {
+            print_warning(&format!(
+                "Saved to {:?} — WARNING: integrity verification failed. \
+                 File kept only because you chose to continue. Treat as unverified.",
+                model_path
+            ));
+        }
+        _ => {
+            print_success(&format!("Saved to {:?}", model_path));
         }
     }
+
+    Ok(())
 }
 
 /// GTCRN speech enhancement model URL and filename
 const GTCRN_MODEL_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speech-enhancement-models/gtcrn_simple.onnx";
 const GTCRN_MODEL_FILENAME: &str = "gtcrn_simple.onnx";
+/// SHA-256 of gtcrn_simple.onnx — pinned at the version shipped with voxtype.
+/// Computed from the canonical release at k2-fsa/sherpa-onnx.
+const GTCRN_MODEL_SHA256: &str = "e77603ac0c23dac3227dd2d7135b3a585cbee2679048aecfa886657d3ae1b534";
+const GTCRN_HELPER_ASSET: RuntimeHelperAssetSpec = RuntimeHelperAssetSpec {
+    filename: GTCRN_MODEL_FILENAME,
+    url: GTCRN_MODEL_URL,
+    sha256: GTCRN_MODEL_SHA256,
+    download_message: "Downloading GTCRN speech enhancement model (523 KB)...",
+    success_message: "Speech enhancement model downloaded.",
+    download_failure_message:
+        "Warning: Failed to download speech enhancement model. Meetings will work without echo cancellation.",
+    curl_missing_message: "Warning: curl not available. Speech enhancement model not downloaded.",
+};
 
 /// ECAPA-TDNN speaker embedding model URL and filename
 const ECAPA_MODEL_URL: &str =
     "https://huggingface.co/pranjal-pravesh/ecapa_tdnn_onnx/resolve/main/ecapa_tdnn.onnx";
 const ECAPA_MODEL_FILENAME: &str = "ecapa_tdnn.onnx";
+/// SHA-256 of ecapa_tdnn.onnx from pranjal-pravesh/ecapa_tdnn_onnx.
+const ECAPA_MODEL_SHA256: &str = "245eb5995cfffd74494862dee33da2b00c1c2579eb0c6703847784e9901ed458";
+const ECAPA_HELPER_ASSET: RuntimeHelperAssetSpec = RuntimeHelperAssetSpec {
+    filename: ECAPA_MODEL_FILENAME,
+    url: ECAPA_MODEL_URL,
+    sha256: ECAPA_MODEL_SHA256,
+    download_message: "Downloading ECAPA-TDNN speaker embedding model (~26 MB)...",
+    success_message: "Speaker embedding model downloaded.",
+    download_failure_message:
+        "Warning: Failed to download speaker embedding model. ML diarization will fall back to simple speaker attribution.",
+    curl_missing_message: "Warning: curl not available. Speaker embedding model not downloaded.",
+};
 
 /// Ensure the GTCRN speech enhancement model is downloaded.
 /// Returns the path to the model file if available, or None if download fails.
 pub fn ensure_gtcrn_model() -> Option<std::path::PathBuf> {
-    let models_dir = Config::models_dir();
-    let model_path = models_dir.join(GTCRN_MODEL_FILENAME);
-
-    if model_path.exists() {
-        return Some(model_path);
-    }
-
-    // Ensure directory exists
-    if let Err(e) = std::fs::create_dir_all(&models_dir) {
-        eprintln!("Warning: Could not create models directory: {}", e);
-        return None;
-    }
-
-    println!("Downloading GTCRN speech enhancement model (523 KB)...");
-
-    let status = Command::new("curl")
-        .args([
-            "-L",
-            "--progress-bar",
-            "-o",
-            model_path.to_str().unwrap_or("gtcrn_simple.onnx"),
-            GTCRN_MODEL_URL,
-        ])
-        .status();
-
-    match status {
-        Ok(exit_status) if exit_status.success() => {
-            println!("Speech enhancement model downloaded.");
-            Some(model_path)
-        }
-        Ok(_) => {
-            eprintln!("Warning: Failed to download speech enhancement model. Meetings will work without echo cancellation.");
-            let _ = std::fs::remove_file(&model_path);
-            None
-        }
-        Err(_) => {
-            eprintln!("Warning: curl not available. Speech enhancement model not downloaded.");
-            None
-        }
-    }
+    ensure_runtime_helper_asset_with(
+        &Config::models_dir(),
+        &GTCRN_HELPER_ASSET,
+        curl_download,
+    )
 }
 
 /// Ensure the ECAPA-TDNN speaker embedding model is downloaded.
 /// Returns the path to the model file if available, or None if download fails.
 /// Used by ML-based speaker diarization in meeting mode.
 pub fn ensure_ecapa_model() -> Option<std::path::PathBuf> {
-    let models_dir = Config::models_dir();
-    let model_path = models_dir.join(ECAPA_MODEL_FILENAME);
-
-    if model_path.exists() {
-        return Some(model_path);
-    }
-
-    // Ensure directory exists
-    if let Err(e) = std::fs::create_dir_all(&models_dir) {
-        eprintln!("Warning: Could not create models directory: {}", e);
-        return None;
-    }
-
-    println!("Downloading ECAPA-TDNN speaker embedding model (~26 MB)...");
-
-    let status = Command::new("curl")
-        .args([
-            "-L",
-            "--progress-bar",
-            "-o",
-            model_path.to_str().unwrap_or(ECAPA_MODEL_FILENAME),
-            ECAPA_MODEL_URL,
-        ])
-        .status();
-
-    match status {
-        Ok(exit_status) if exit_status.success() => {
-            println!("Speaker embedding model downloaded.");
-            Some(model_path)
-        }
-        Ok(_) => {
-            eprintln!("Warning: Failed to download speaker embedding model. ML diarization will fall back to simple speaker attribution.");
-            let _ = std::fs::remove_file(&model_path);
-            None
-        }
-        Err(_) => {
-            eprintln!("Warning: curl not available. Speaker embedding model not downloaded.");
-            None
-        }
-    }
+    ensure_runtime_helper_asset_with(
+        &Config::models_dir(),
+        &ECAPA_HELPER_ASSET,
+        curl_download,
+    )
 }
 
 /// Set a specific model as the default (must already be downloaded)
@@ -1614,6 +1851,7 @@ pub fn download_parakeet_model(model_name: &str) -> anyhow::Result<()> {
 fn download_parakeet_model_by_info(model: &ParakeetModelInfo) -> anyhow::Result<()> {
     let models_dir = Config::models_dir();
     let model_path = models_dir.join(model.name);
+    let mut prompt_cache = IntegrityPromptCache::default();
 
     // Create model directory
     std::fs::create_dir_all(&model_path)?;
@@ -1623,47 +1861,23 @@ fn download_parakeet_model_by_info(model: &ParakeetModelInfo) -> anyhow::Result<
     for (filename, _expected_size) in model.files {
         let file_path = model_path.join(filename);
 
-        if file_path.exists() {
-            println!("  {} already exists, skipping", filename);
-            continue;
-        }
-
         let url = format!(
             "https://huggingface.co/{}/resolve/main/{}",
             model.huggingface_repo, filename
         );
+        let hash_status = fetch_hf_expected_hash(model.huggingface_repo, filename, filename)?;
+        let expected_hash = resolve_hash_status(&hash_status);
+        let mut announced_download = false;
 
-        println!("Downloading {}...", filename);
+        let outcome = ensure_setup_file(&file_path, expected_hash, &mut prompt_cache, || {
+            if !announced_download {
+                println!("Downloading {}...", filename);
+                announced_download = true;
+            }
+            curl_download(&file_path, &url, true)
+        })?;
 
-        let status = Command::new("curl")
-            .args([
-                "-L",
-                "--progress-bar",
-                "-o",
-                file_path.to_str().unwrap_or("file"),
-                &url,
-            ])
-            .status();
-
-        match status {
-            Ok(exit_status) if exit_status.success() => {
-                // Success, continue
-            }
-            Ok(exit_status) => {
-                print_failure(&format!(
-                    "Download failed: curl exited with code {}",
-                    exit_status.code().unwrap_or(-1)
-                ));
-                // Clean up partial download
-                let _ = std::fs::remove_file(&file_path);
-                anyhow::bail!("Download failed for {}", filename)
-            }
-            Err(e) => {
-                print_failure(&format!("Failed to run curl: {}", e));
-                print_info("Please ensure curl is installed (e.g., 'sudo pacman -S curl')");
-                anyhow::bail!("curl not available: {}", e)
-            }
-        }
+        report_setup_outcome(filename, outcome);
     }
 
     // Validate all files are present
@@ -1886,6 +2100,7 @@ pub fn download_moonshine_model(model_name: &str) -> anyhow::Result<()> {
 fn download_moonshine_model_by_info(model: &MoonshineModelInfo) -> anyhow::Result<()> {
     let models_dir = Config::models_dir();
     let model_path = models_dir.join(model.dir_name);
+    let mut prompt_cache = IntegrityPromptCache::default();
 
     // Create model directory
     std::fs::create_dir_all(&model_path)?;
@@ -1898,47 +2113,24 @@ fn download_moonshine_model_by_info(model: &MoonshineModelInfo) -> anyhow::Resul
     for (repo_path, local_filename) in model.files {
         let file_path = model_path.join(local_filename);
 
-        if file_path.exists() {
-            println!("  {} already exists, skipping", local_filename);
-            continue;
-        }
-
         let url = format!(
             "https://huggingface.co/{}/resolve/main/{}",
             model.huggingface_repo, repo_path
         );
+        let hash_status =
+            fetch_hf_expected_hash(model.huggingface_repo, repo_path, local_filename)?;
+        let expected_hash = resolve_hash_status(&hash_status);
+        let mut announced_download = false;
 
-        println!("Downloading {}...", local_filename);
+        let outcome = ensure_setup_file(&file_path, expected_hash, &mut prompt_cache, || {
+            if !announced_download {
+                println!("Downloading {}...", local_filename);
+                announced_download = true;
+            }
+            curl_download(&file_path, &url, true)
+        })?;
 
-        let status = Command::new("curl")
-            .args([
-                "-L",
-                "--progress-bar",
-                "-o",
-                file_path.to_str().unwrap_or("file"),
-                &url,
-            ])
-            .status();
-
-        match status {
-            Ok(exit_status) if exit_status.success() => {
-                // Success, continue
-            }
-            Ok(exit_status) => {
-                print_failure(&format!(
-                    "Download failed: curl exited with code {}",
-                    exit_status.code().unwrap_or(-1)
-                ));
-                // Clean up partial download
-                let _ = std::fs::remove_file(&file_path);
-                anyhow::bail!("Download failed for {}", local_filename)
-            }
-            Err(e) => {
-                print_failure(&format!("Failed to run curl: {}", e));
-                print_info("Please ensure curl is installed (e.g., 'sudo pacman -S curl')");
-                anyhow::bail!("curl not available: {}", e)
-            }
-        }
+        report_setup_outcome(local_filename, outcome);
     }
 
     // Validate all files are present
@@ -2006,6 +2198,7 @@ pub fn download_cohere_model(model_name: &str) -> anyhow::Result<()> {
 fn download_cohere_model_by_info(model: &CohereModelInfo) -> anyhow::Result<()> {
     let models_dir = Config::models_dir();
     let model_path = models_dir.join(model.dir_name);
+    let mut prompt_cache = IntegrityPromptCache::default();
     std::fs::create_dir_all(&model_path)?;
 
     // Cohere is a multi-GB download. Even with a fast connection it's a
@@ -2028,44 +2221,24 @@ fn download_cohere_model_by_info(model: &CohereModelInfo) -> anyhow::Result<()> 
     for (repo_path, local_filename) in model.files {
         let file_path = model_path.join(local_filename);
 
-        if file_path.exists() {
-            println!("  {} already exists, skipping", local_filename);
-            continue;
-        }
-
         let url = format!(
             "https://huggingface.co/{}/resolve/main/{}",
             model.huggingface_repo, repo_path
         );
+        let hash_status =
+            fetch_hf_expected_hash(model.huggingface_repo, repo_path, local_filename)?;
+        let expected_hash = resolve_hash_status(&hash_status);
+        let mut announced_download = false;
 
-        println!("Downloading {}...", local_filename);
-
-        let status = Command::new("curl")
-            .args([
-                "-L",
-                "--progress-bar",
-                "-o",
-                file_path.to_str().unwrap_or("file"),
-                &url,
-            ])
-            .status();
-
-        match status {
-            Ok(exit_status) if exit_status.success() => {}
-            Ok(exit_status) => {
-                print_failure(&format!(
-                    "Download failed: curl exited with code {}",
-                    exit_status.code().unwrap_or(-1)
-                ));
-                let _ = std::fs::remove_file(&file_path);
-                anyhow::bail!("Download failed for {}", local_filename)
+        let outcome = ensure_setup_file(&file_path, expected_hash, &mut prompt_cache, || {
+            if !announced_download {
+                println!("Downloading {}...", local_filename);
+                announced_download = true;
             }
-            Err(e) => {
-                print_failure(&format!("Failed to run curl: {}", e));
-                print_info("Please ensure curl is installed (e.g., 'sudo pacman -S curl')");
-                anyhow::bail!("curl not available: {}", e)
-            }
-        }
+            curl_download(&file_path, &url, true)
+        })?;
+
+        report_setup_outcome(local_filename, outcome);
     }
 
     validate_cohere_model(&model_path)?;
@@ -2494,6 +2667,7 @@ pub fn download_sensevoice_model(model_name: &str) -> anyhow::Result<()> {
 fn download_sensevoice_model_by_info(model: &SenseVoiceModelInfo) -> anyhow::Result<()> {
     let models_dir = Config::models_dir();
     let model_path = models_dir.join(model.dir_name);
+    let mut prompt_cache = IntegrityPromptCache::default();
 
     // Create model directory
     std::fs::create_dir_all(&model_path)?;
@@ -2506,46 +2680,24 @@ fn download_sensevoice_model_by_info(model: &SenseVoiceModelInfo) -> anyhow::Res
     for (repo_path, local_filename) in model.files {
         let file_path = model_path.join(local_filename);
 
-        if file_path.exists() {
-            println!("  {} already exists, skipping", local_filename);
-            continue;
-        }
-
         let url = format!(
             "https://huggingface.co/{}/resolve/main/{}",
             model.huggingface_repo, repo_path
         );
+        let hash_status =
+            fetch_hf_expected_hash(model.huggingface_repo, repo_path, local_filename)?;
+        let expected_hash = resolve_hash_status(&hash_status);
+        let mut announced_download = false;
 
-        println!("Downloading {}...", local_filename);
+        let outcome = ensure_setup_file(&file_path, expected_hash, &mut prompt_cache, || {
+            if !announced_download {
+                println!("Downloading {}...", local_filename);
+                announced_download = true;
+            }
+            curl_download(&file_path, &url, true)
+        })?;
 
-        let status = Command::new("curl")
-            .args([
-                "-L",
-                "--progress-bar",
-                "-o",
-                file_path.to_str().unwrap_or("file"),
-                &url,
-            ])
-            .status();
-
-        match status {
-            Ok(exit_status) if exit_status.success() => {
-                // Success, continue
-            }
-            Ok(exit_status) => {
-                print_failure(&format!(
-                    "Download failed: curl exited with code {}",
-                    exit_status.code().unwrap_or(-1)
-                ));
-                let _ = std::fs::remove_file(&file_path);
-                anyhow::bail!("Download failed for {}", local_filename)
-            }
-            Err(e) => {
-                print_failure(&format!("Failed to run curl: {}", e));
-                print_info("Please ensure curl is installed (e.g., 'sudo pacman -S curl')");
-                anyhow::bail!("curl not available: {}", e)
-            }
-        }
+        report_setup_outcome(local_filename, outcome);
     }
 
     // Validate all files are present
@@ -2798,6 +2950,7 @@ fn download_onnx_model(
 ) -> anyhow::Result<()> {
     let models_dir = Config::models_dir();
     let model_path = models_dir.join(dir_name);
+    let mut prompt_cache = IntegrityPromptCache::default();
 
     std::fs::create_dir_all(&model_path)?;
 
@@ -2806,41 +2959,20 @@ fn download_onnx_model(
     for (repo_path, local_filename) in files {
         let file_path = model_path.join(local_filename);
 
-        if file_path.exists() {
-            println!("  {} already exists, skipping", local_filename);
-            continue;
-        }
-
         let url = format!("https://huggingface.co/{}/resolve/main/{}", repo, repo_path);
+        let hash_status = fetch_hf_expected_hash(repo, repo_path, local_filename)?;
+        let expected_hash = resolve_hash_status(&hash_status);
+        let mut announced_download = false;
 
-        println!("Downloading {}...", local_filename);
-
-        let status = Command::new("curl")
-            .args([
-                "-L",
-                "--progress-bar",
-                "-o",
-                file_path.to_str().unwrap_or("file"),
-                &url,
-            ])
-            .status();
-
-        match status {
-            Ok(exit_status) if exit_status.success() => {}
-            Ok(exit_status) => {
-                print_failure(&format!(
-                    "Download failed: curl exited with code {}",
-                    exit_status.code().unwrap_or(-1)
-                ));
-                let _ = std::fs::remove_file(&file_path);
-                anyhow::bail!("Download failed for {}", local_filename)
+        let outcome = ensure_setup_file(&file_path, expected_hash, &mut prompt_cache, || {
+            if !announced_download {
+                println!("Downloading {}...", local_filename);
+                announced_download = true;
             }
-            Err(e) => {
-                print_failure(&format!("Failed to run curl: {}", e));
-                print_info("Please ensure curl is installed (e.g., 'sudo pacman -S curl')");
-                anyhow::bail!("curl not available: {}", e)
-            }
-        }
+            curl_download(&file_path, &url, true)
+        })?;
+
+        report_setup_outcome(local_filename, outcome);
     }
 
     Ok(())
@@ -2942,6 +3074,34 @@ fn update_engine_in_config(config: &str, engine_name: &str, model_name: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+    use std::cell::Cell;
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect()
+    }
+
+    fn leaked_hash(bytes: &[u8]) -> &'static str {
+        Box::leak(sha256_hex(bytes).into_boxed_str())
+    }
+
+    fn test_helper_asset(filename: &'static str, sha256: &'static str) -> RuntimeHelperAssetSpec {
+        RuntimeHelperAssetSpec {
+            filename,
+            url: "https://example.com/model.onnx",
+            sha256,
+            download_message: "Downloading helper asset...",
+            success_message: "Helper asset downloaded.",
+            download_failure_message: "Warning: helper asset download failed.",
+            curl_missing_message: "Warning: curl not available.",
+        }
+    }
 
     #[test]
     fn test_update_model_in_config_basic() {
@@ -3551,5 +3711,549 @@ mode = "type"
         let msg = err.to_string();
         assert!(msg.contains("encoder_model.onnx"), "got: {}", msg);
         assert!(msg.contains("tokenizer.json"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_valid_cached_gtcrn_reuse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let good = b"gtcrn-good";
+        let hash = leaked_hash(good);
+        let spec = test_helper_asset(GTCRN_MODEL_FILENAME, hash);
+        let model_path = tmp.path().join(GTCRN_MODEL_FILENAME);
+        std::fs::write(&model_path, good).unwrap();
+        let download_calls = Cell::new(0);
+
+        let result = ensure_runtime_helper_asset_with(tmp.path(), &spec, |_, _, _| {
+            download_calls.set(download_calls.get() + 1);
+            Ok(())
+        });
+
+        assert_eq!(result, Some(model_path));
+        assert_eq!(download_calls.get(), 0);
+    }
+
+    #[test]
+    fn test_gtcrn_mismatch_repaired_silently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let good = b"gtcrn-good";
+        let hash = leaked_hash(good);
+        let spec = test_helper_asset(GTCRN_MODEL_FILENAME, hash);
+        let model_path = tmp.path().join(GTCRN_MODEL_FILENAME);
+        std::fs::write(&model_path, b"bad").unwrap();
+        let download_calls = Cell::new(0);
+        let progress_flags = Cell::new(0);
+
+        let result =
+            ensure_runtime_helper_asset_with(tmp.path(), &spec, |path, _, show_progress| {
+                download_calls.set(download_calls.get() + 1);
+                progress_flags.set(progress_flags.get() + usize::from(show_progress));
+                std::fs::write(path, good).unwrap();
+                Ok(())
+            });
+
+        assert_eq!(result, Some(model_path.clone()));
+        assert_eq!(download_calls.get(), 1);
+        assert_eq!(progress_flags.get(), 0, "cached repair should stay silent");
+        assert_eq!(std::fs::read(&model_path).unwrap(), good);
+    }
+
+    #[test]
+    fn test_gtcrn_repair_failure_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hash = leaked_hash(b"gtcrn-good");
+        let spec = test_helper_asset(GTCRN_MODEL_FILENAME, hash);
+        let model_path = tmp.path().join(GTCRN_MODEL_FILENAME);
+        std::fs::write(&model_path, b"bad").unwrap();
+        let download_calls = Cell::new(0);
+
+        let result = ensure_runtime_helper_asset_with(tmp.path(), &spec, |path, _, _| {
+            download_calls.set(download_calls.get() + 1);
+            std::fs::write(path, b"still-bad").unwrap();
+            Ok(())
+        });
+
+        assert!(result.is_none());
+        assert_eq!(download_calls.get(), 1);
+        assert!(
+            !model_path.exists(),
+            "failed repair should remove the bad helper asset"
+        );
+    }
+
+    #[test]
+    fn test_valid_cached_ecapa_reuse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let good = b"ecapa-good";
+        let hash = leaked_hash(good);
+        let spec = test_helper_asset(ECAPA_MODEL_FILENAME, hash);
+        let model_path = tmp.path().join(ECAPA_MODEL_FILENAME);
+        std::fs::write(&model_path, good).unwrap();
+        let download_calls = Cell::new(0);
+
+        let result = ensure_runtime_helper_asset_with(tmp.path(), &spec, |_, _, _| {
+            download_calls.set(download_calls.get() + 1);
+            Ok(())
+        });
+
+        assert_eq!(result, Some(model_path));
+        assert_eq!(download_calls.get(), 0);
+    }
+
+    #[test]
+    fn test_ecapa_mismatch_repaired_silently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let good = b"ecapa-good";
+        let hash = leaked_hash(good);
+        let spec = test_helper_asset(ECAPA_MODEL_FILENAME, hash);
+        let model_path = tmp.path().join(ECAPA_MODEL_FILENAME);
+        std::fs::write(&model_path, b"bad").unwrap();
+        let download_calls = Cell::new(0);
+
+        let result =
+            ensure_runtime_helper_asset_with(tmp.path(), &spec, |path, _, show_progress| {
+                download_calls.set(download_calls.get() + 1);
+                assert!(!show_progress, "cached helper repair should stay silent");
+                std::fs::write(path, good).unwrap();
+                Ok(())
+            });
+
+        assert_eq!(result, Some(model_path.clone()));
+        assert_eq!(download_calls.get(), 1);
+        assert_eq!(std::fs::read(&model_path).unwrap(), good);
+    }
+
+    #[test]
+    fn test_ecapa_repair_failure_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hash = leaked_hash(b"ecapa-good");
+        let spec = test_helper_asset(ECAPA_MODEL_FILENAME, hash);
+        let model_path = tmp.path().join(ECAPA_MODEL_FILENAME);
+        std::fs::write(&model_path, b"bad").unwrap();
+        let download_calls = Cell::new(0);
+
+        let result = ensure_runtime_helper_asset_with(tmp.path(), &spec, |path, _, _| {
+            download_calls.set(download_calls.get() + 1);
+            std::fs::write(path, b"still-bad").unwrap();
+            Ok(())
+        });
+
+        assert!(result.is_none());
+        assert_eq!(download_calls.get(), 1);
+        assert!(
+            !model_path.exists(),
+            "failed repair should remove the bad helper asset"
+        );
+    }
+
+    #[test]
+    fn test_explicit_setup_paths_reverify_cached_files_before_skipping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("cached.bin");
+        let good = b"setup-good";
+        std::fs::write(&file_path, good).unwrap();
+        let expected = sha256_hex(good);
+        let download_calls = Cell::new(0);
+        let prompt_calls = Cell::new(0);
+        let mut prompt_cache = IntegrityPromptCache::default();
+
+        let outcome = ensure_setup_file_with_prompt(
+            &file_path,
+            Some(&expected),
+            &mut prompt_cache,
+            || {
+                download_calls.set(download_calls.get() + 1);
+                Ok(())
+            },
+            |_, _| {
+                prompt_calls.set(prompt_calls.get() + 1);
+                false
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome, IntegrityOutcome::ReusedVerified);
+        assert_eq!(download_calls.get(), 0);
+        assert_eq!(prompt_calls.get(), 0);
+    }
+
+    #[test]
+    fn test_explicit_setup_paths_only_prompt_after_repair_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("cached.bin");
+        std::fs::write(&file_path, b"bad").unwrap();
+        let expected = sha256_hex(b"setup-good");
+        let download_calls = Cell::new(0);
+        let prompt_calls = Cell::new(0);
+        let mut prompt_cache = IntegrityPromptCache::default();
+
+        let err = ensure_setup_file_with_prompt(
+            &file_path,
+            Some(&expected),
+            &mut prompt_cache,
+            || {
+                download_calls.set(download_calls.get() + 1);
+                std::fs::write(&file_path, b"still-bad").unwrap();
+                Ok(())
+            },
+            |_, _| {
+                prompt_calls.set(prompt_calls.get() + 1);
+                false
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("SHA-256 mismatch"));
+        assert_eq!(
+            download_calls.get(),
+            1,
+            "cached mismatch should get one repair attempt before prompting"
+        );
+        assert_eq!(prompt_calls.get(), 1);
+        assert!(
+            !file_path.exists(),
+            "declined mismatch should remove the bad cached file"
+        );
+    }
+
+    // =========================================================================
+    // resolve_hash_status tests
+    // =========================================================================
+
+    #[test]
+    fn test_resolve_hash_status_known_hash_returns_some_str() {
+        let hash = "a".repeat(64);
+        let status = CanonicalHashStatus::KnownHash(hash.clone());
+        assert_eq!(resolve_hash_status(&status), Some(hash.as_str()));
+    }
+
+    #[test]
+    fn test_resolve_hash_status_no_canonical_hash_returns_none() {
+        let status = CanonicalHashStatus::NoCanonicalHash;
+        assert_eq!(resolve_hash_status(&status), None);
+    }
+
+    // =========================================================================
+    // ensure_model_file_with_fetcher tests
+    // =========================================================================
+
+    /// Builds a temporary file path inside `dir` with the given content.
+    fn write_tmp(dir: &tempfile::TempDir, name: &str, content: &[u8]) -> std::path::PathBuf {
+        let p = dir.path().join(name);
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    #[test]
+    fn test_ensure_model_file_with_fetcher_known_hash_verifies() {
+        // File already on disk with correct content; KnownHash should verify it.
+        let dir = tempfile::tempdir().unwrap();
+        let data = b"correct data";
+        let hash = sha256_hex(data);
+        let file_path = write_tmp(&dir, "model.bin", data);
+
+        let mut prompt_cache = IntegrityPromptCache::default();
+        let download_calls = Cell::new(0);
+
+        let outcome = ensure_model_file_with_fetcher(
+            &file_path,
+            "test/repo",
+            "model.bin",
+            "model.bin",
+            &mut prompt_cache,
+            |_repo, _filename| Ok(CanonicalHashStatus::KnownHash(hash.clone())),
+            || {
+                download_calls.set(download_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome, IntegrityOutcome::ReusedVerified);
+        assert_eq!(
+            download_calls.get(),
+            0,
+            "no download needed for already-correct file"
+        );
+    }
+
+    #[test]
+    fn test_ensure_model_file_with_fetcher_no_canonical_hash_proceeds_without_verification() {
+        // NoCanonicalHash means the file is inline (small), no LFS hash.
+        // The engine should proceed without verification (hash=None path).
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = write_tmp(&dir, "config.json", b"{\"key\":\"val\"}");
+        let download_calls = Cell::new(0);
+        let mut prompt_cache = IntegrityPromptCache::default();
+
+        let outcome = ensure_model_file_with_fetcher(
+            &file_path,
+            "test/repo",
+            "config.json",
+            "config.json",
+            &mut prompt_cache,
+            |_repo, _filename| Ok(CanonicalHashStatus::NoCanonicalHash),
+            || {
+                download_calls.set(download_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        // No hash → no verification → ReusedWithoutHash (file already existed)
+        assert_eq!(outcome, IntegrityOutcome::ReusedWithoutHash);
+        assert_eq!(download_calls.get(), 0);
+    }
+
+    #[test]
+    fn test_ensure_model_file_with_fetcher_metadata_error_fails_closed() {
+        // Transport/parse error: hash_fetcher returns Err.
+        // The function MUST propagate the error, not proceed as if hash=None.
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("model.bin");
+        // File doesn't exist — would need to be downloaded.
+        let mut prompt_cache = IntegrityPromptCache::default();
+        let download_calls = Cell::new(0);
+
+        let err = ensure_model_file_with_fetcher(
+            &file_path,
+            "test/repo",
+            "model.bin",
+            "model.bin",
+            &mut prompt_cache,
+            |_repo, _filename| Err(anyhow::anyhow!("network timeout")),
+            || {
+                download_calls.set(download_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("network timeout")
+                || err.to_string().contains("canonical hash"),
+            "error must carry context about the metadata failure; got: {err}"
+        );
+        assert_eq!(
+            download_calls.get(),
+            0,
+            "must not attempt download after metadata failure"
+        );
+    }
+
+    #[test]
+    fn test_ensure_model_file_with_fetcher_missing_in_metadata_fails_closed() {
+        // File not found in HF metadata → fetch_hf_lfs_sha256 returns Err("not in siblings").
+        // Simulated by returning Err here. This must not silently proceed.
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("missing.onnx");
+        let mut prompt_cache = IntegrityPromptCache::default();
+        let download_calls = Cell::new(0);
+
+        let err = ensure_model_file_with_fetcher(
+            &file_path,
+            "test/repo",
+            "missing.onnx",
+            "missing.onnx",
+            &mut prompt_cache,
+            |_repo, _filename| {
+                Err(anyhow::anyhow!(
+                    "'missing.onnx' not found in HuggingFace repository metadata for 'test/repo'"
+                ))
+            },
+            || {
+                download_calls.set(download_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing.onnx") || msg.contains("not found"),
+            "error should reference the missing file; got: {msg}"
+        );
+        assert_eq!(download_calls.get(), 0);
+    }
+
+    #[test]
+    fn test_multi_file_download_fails_on_metadata_error_for_one_file() {
+        // Simulate a multi-file download loop: one file has a network failure
+        // fetching its hash. The entire loop should stop (? propagation).
+        let dir = tempfile::tempdir().unwrap();
+        let mut prompt_cache = IntegrityPromptCache::default();
+        let files = [
+            ("encoder.onnx", b"enc-data" as &[u8]),
+            ("vocab.txt", b"vocab"),
+        ];
+        let download_calls = Cell::new(0);
+        let fetcher_calls = Cell::new(0);
+
+        // Simulate: first file OK, second file → network error
+        let result: anyhow::Result<()> = (|| {
+            for (filename, content) in &files {
+                let file_path = write_tmp(&dir, filename, content);
+                let call_n = fetcher_calls.get();
+                fetcher_calls.set(call_n + 1);
+
+                let outcome = ensure_model_file_with_fetcher(
+                    &file_path,
+                    "test/repo",
+                    filename,
+                    filename,
+                    &mut prompt_cache,
+                    |_repo, _file| {
+                        if *filename == "vocab.txt" {
+                            Err(anyhow::anyhow!("timeout fetching hash for vocab.txt"))
+                        } else {
+                            Ok(CanonicalHashStatus::KnownHash(sha256_hex(content)))
+                        }
+                    },
+                    || {
+                        download_calls.set(download_calls.get() + 1);
+                        Ok(())
+                    },
+                )?;
+                let _ = outcome;
+            }
+            Ok(())
+        })();
+
+        assert!(result.is_err(), "loop must abort on metadata failure");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("vocab.txt") || msg.contains("timeout"),
+            "error should identify which file caused the failure; got: {msg}"
+        );
+        assert_eq!(
+            download_calls.get(),
+            0,
+            "no download should have started after the error"
+        );
+    }
+
+    #[test]
+    fn test_multi_file_download_succeeds_with_mixed_hash_statuses() {
+        // One file has a KnownHash, another is NoCanonicalHash (small inline file).
+        // Both should succeed without error.
+        let dir = tempfile::tempdir().unwrap();
+        let mut prompt_cache = IntegrityPromptCache::default();
+        let data_onnx = b"onnx model data";
+        let data_config = b"{\"version\":1}";
+        let hash_onnx = sha256_hex(data_onnx);
+
+        let files = [
+            ("encoder.onnx", data_onnx as &[u8], Some(hash_onnx.clone())),
+            ("config.json", data_config, None), // inline, NoCanonicalHash
+        ];
+
+        for (filename, content, maybe_hash) in &files {
+            let file_path = write_tmp(&dir, filename, content);
+            let hash_clone = maybe_hash.clone();
+
+            let outcome = ensure_model_file_with_fetcher(
+                &file_path,
+                "test/repo",
+                filename,
+                filename,
+                &mut prompt_cache,
+                move |_repo, _file| {
+                    Ok(match hash_clone {
+                        Some(ref h) => CanonicalHashStatus::KnownHash(h.clone()),
+                        None => CanonicalHashStatus::NoCanonicalHash,
+                    })
+                },
+                || Ok(()),
+            )
+            .unwrap();
+
+            match maybe_hash {
+                Some(_) => assert_eq!(outcome, IntegrityOutcome::ReusedVerified),
+                None => assert_eq!(outcome, IntegrityOutcome::ReusedWithoutHash),
+            }
+        }
+    }
+
+    // =========================================================================
+    // classify_outcome / SetupOutcomeKind reporting-helper tests
+    // =========================================================================
+
+    #[test]
+    fn test_classify_outcome_accepted_by_user_is_unverified_not_downloaded() {
+        // AcceptedByUser must NOT collapse into the generic Downloaded or Other
+        // kinds — it needs its own distinct warning category.
+        let kind = classify_outcome(IntegrityOutcome::AcceptedByUser);
+        assert_eq!(kind, SetupOutcomeKind::AcceptedByUserUnverified);
+        assert_ne!(kind, SetupOutcomeKind::Downloaded);
+        assert_ne!(kind, SetupOutcomeKind::Other);
+    }
+
+    #[test]
+    fn test_classify_outcome_reused_verified_maps_correctly() {
+        assert_eq!(
+            classify_outcome(IntegrityOutcome::ReusedVerified),
+            SetupOutcomeKind::AlreadyVerified
+        );
+    }
+
+    #[test]
+    fn test_classify_outcome_reused_without_hash_maps_correctly() {
+        assert_eq!(
+            classify_outcome(IntegrityOutcome::ReusedWithoutHash),
+            SetupOutcomeKind::AlreadyCachedNoHash
+        );
+    }
+
+    #[test]
+    fn test_classify_outcome_repaired_maps_correctly() {
+        assert_eq!(
+            classify_outcome(IntegrityOutcome::Repaired),
+            SetupOutcomeKind::Repaired
+        );
+    }
+
+    #[test]
+    fn test_classify_outcome_downloaded_verified_maps_correctly() {
+        assert_eq!(
+            classify_outcome(IntegrityOutcome::DownloadedVerified),
+            SetupOutcomeKind::Downloaded
+        );
+    }
+
+    // =========================================================================
+    // Integration-style: explicit setup orchestration → AcceptedByUser
+    // =========================================================================
+
+    /// Drive `ensure_setup_file_with_prompt` so that every download writes
+    /// wrong content, the user accepts the risk, and the outcome is
+    /// `AcceptedByUser`.  Then assert that `classify_outcome` does NOT map
+    /// that outcome to `Downloaded` or `Other` — i.e. the reporting layer
+    /// preserves the distinction.
+    #[test]
+    fn test_explicit_setup_accepted_by_user_is_classified_as_unverified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("model.bin");
+        let expected = sha256_hex(b"correct-content");
+        let mut prompt_cache = IntegrityPromptCache::default();
+
+        // Both download attempts write the wrong content.
+        let outcome = ensure_setup_file_with_prompt(
+            &file_path,
+            Some(&expected),
+            &mut prompt_cache,
+            || {
+                std::fs::write(&file_path, b"wrong-content").unwrap();
+                Ok(())
+            },
+            |_, _| true, // user accepts
+        )
+        .unwrap();
+
+        assert_eq!(outcome, IntegrityOutcome::AcceptedByUser);
+
+        // The reporting helper must distinguish this from a normal download.
+        let kind = classify_outcome(outcome);
+        assert_eq!(kind, SetupOutcomeKind::AcceptedByUserUnverified);
+        assert_ne!(kind, SetupOutcomeKind::Downloaded);
+        assert_ne!(kind, SetupOutcomeKind::Other);
     }
 }

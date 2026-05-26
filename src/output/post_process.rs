@@ -407,11 +407,10 @@ mod tests {
         // Even if VOXTYPE_CONTEXT is set in parent env, it should be cleared when context is None.
         // Uses current_thread runtime because std::env::set_var is not thread-safe
         // and will become unsafe in Rust edition 2024.
-        std::env::set_var("VOXTYPE_CONTEXT", "stale parent context");
+        let _guard = crate::test_env::EnvGuard::set("VOXTYPE_CONTEXT", "stale parent context");
         let config = make_config("echo \"${VOXTYPE_CONTEXT:-unset}\"", 5000);
         let processor = PostProcessor::new(&config);
         let result = processor.process_with_context("text", None).await;
-        std::env::remove_var("VOXTYPE_CONTEXT");
         assert_eq!(result, "unset");
     }
 }

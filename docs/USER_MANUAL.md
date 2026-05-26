@@ -1250,8 +1250,15 @@ backend = "remote"
 # Language setting still applies
 language = "en"
 
-# Your whisper.cpp server address
-remote_endpoint = "http://192.168.1.100:8080"
+# Same-machine whisper.cpp server
+remote_endpoint = "http://127.0.0.1:8080"
+
+# Or a TLS-protected server on your network:
+# remote_endpoint = "https://whisper.example.internal"
+
+# If you intentionally use cleartext HTTP on a trusted LAN instead:
+# remote_endpoint = "http://192.168.1.100:8080"
+# remote_allow_insecure_http = true
 
 # Model name sent to server (whisper.cpp ignores this, but OpenAI requires it)
 remote_model = "whisper-1"
@@ -1293,7 +1300,9 @@ export VOXTYPE_WHISPER_API_KEY="sk-..."
 
 ### Security Recommendations
 
-1. **Use HTTPS for non-local servers**: Voxtype warns if you configure an HTTP endpoint for non-localhost addresses, as audio would be transmitted unencrypted.
+1. **Use HTTPS for non-local servers**: Voxtype rejects non-loopback `http://` endpoints by default, because your audio would otherwise be transmitted unencrypted.
+
+  If your self-hosted server runs on the same machine, loopback HTTP such as `http://127.0.0.1:8080` is allowed. If you intentionally use cleartext HTTP to another machine on a trusted LAN, set `remote_allow_insecure_http = true`, `VOXTYPE_ALLOW_INSECURE_HTTP=1`, or pass `--allow-insecure-http`.
 
 2. **Prefer environment variables for API keys**: Use `VOXTYPE_WHISPER_API_KEY` instead of putting keys in config files.
 
@@ -2131,6 +2140,7 @@ voxtype --vad daemon
   ```bash
   voxtype setup vad
   ```
+  The setup command verifies the cached VAD file before reuse, repairs one bad cached copy automatically, and only prompts if that repair still fails. Normal runtime VAD loading does not auto-download or prompt.
 
 ### When to Use VAD
 
@@ -2229,6 +2239,8 @@ voxtype meeting label latest 1 "Bob"  # Short form: just the number
 
 Labels persist in the meeting data and appear in exports.
 
+If you switch `[meeting.diarization] backend` to `"ml"`, voxtype downloads the ECAPA-TDNN speaker-embedding model on first use. Cached copies are verified silently on reuse, a bad cached copy is re-downloaded once automatically, and meeting mode falls back to simple diarization instead of prompting if repair still fails.
+
 ### AI Summarization
 
 Meeting summarization uses Ollama (local) or a remote API to generate a summary with key points, action items, and decisions.
@@ -2246,6 +2258,8 @@ When `loopback_device` is enabled, meeting mode captures both your microphone an
 Voxtype uses GTCRN, a lightweight neural speech enhancement model, to clean the mic signal before transcription. The model removes background noise and speaker bleed-through while preserving your voice. A second pass at the transcript level strips any residual echoed phrases.
 
 The GTCRN model (~523 KB) is downloaded automatically the first time you run `voxtype meeting start`. To disable echo cancellation (e.g., if you have PipeWire's `echo-cancel` module configured):
+
+Cached GTCRN files are verified silently on reuse. If a cached copy is damaged or replaced, voxtype re-downloads it once automatically and then falls back to no enhancement instead of prompting during normal meeting startup.
 
 ```toml
 [meeting.audio]

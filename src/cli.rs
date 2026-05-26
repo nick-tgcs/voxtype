@@ -173,6 +173,10 @@ pub struct Cli {
     )]
     pub remote_api_key: Option<String>,
 
+    /// Allow non-loopback HTTP for remote transcription (audio sent unencrypted; not recommended)
+    #[arg(long, help_heading = "Whisper", hide_short_help = true)]
+    pub allow_insecure_http: bool,
+
     // -- Soniox --
     /// API key for Soniox (or use SONIOX_API_KEY env var)
     #[arg(

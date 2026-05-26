@@ -642,12 +642,11 @@ mod tests {
         // Create a real Unix socket so metadata().file_type().is_socket() is true
         let _listener = UnixListener::bind(&sock_path).unwrap();
 
-        // Temporarily set YDOTOOL_SOCKET to point at our test socket.
-        // This is inherently racy in multi-threaded test runs, but it's the
-        // simplest way to exercise the env-var priority path.
-        std::env::set_var("YDOTOOL_SOCKET", &sock_path);
+        let _guard = crate::test_env::EnvGuard::set(
+            "YDOTOOL_SOCKET",
+            sock_path.to_str().unwrap(),
+        );
         let result = find_ydotool_socket();
-        std::env::remove_var("YDOTOOL_SOCKET");
 
         assert_eq!(result, Some(sock_path));
     }

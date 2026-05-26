@@ -147,14 +147,14 @@ mod tests {
 
     #[test]
     fn theme_dir_resolves_under_home() {
-        std::env::set_var("HOME", "/tmp/fakehome");
+        let _guard = crate::test_env::EnvGuard::set("HOME", "/tmp/fakehome");
         let p = omarchy_theme_dir().unwrap();
         assert!(p.ends_with(".config/omarchy/current/theme"));
     }
 
     #[test]
     fn missing_theme_dir_yields_fallback() {
-        std::env::set_var("HOME", "/tmp/this-dir-should-not-exist-voxtype-test");
+        let _guard = crate::test_env::EnvGuard::set("HOME", "/tmp/this-dir-should-not-exist-voxtype-test");
         assert_eq!(load_palette(), Palette::fallback());
     }
 

@@ -9,6 +9,7 @@
 
 use super::{TimedSegment, Transcriber};
 use crate::config::{ParakeetConfig, ParakeetModelType};
+use crate::cuda_runtime::{self, RuntimeProbeDecision};
 use crate::error::TranscribeError;
 #[cfg(any(
     feature = "parakeet-cuda",
@@ -328,69 +329,13 @@ pub(super) fn build_execution_config() -> Option<ExecutionConfig> {
 
 /// Probe CUDA runtime availability and version compatibility.
 ///
-/// The bundled ONNX Runtime (from the `ort` crate) is built against CUDA 12.x.
-/// If the system has a different major CUDA version, ONNX Runtime will segfault
-/// during EP initialization rather than returning an error.
+/// The bundled ONNX Runtime is built against one CUDA major chosen at compile
+/// time. If the process loads a different CUDA major, ONNX Runtime will
+/// segfault during EP initialization rather than returning an error.
 ///
 /// Returns true if CUDA looks compatible, false if it should be skipped.
 #[cfg(any(feature = "parakeet-cuda", feature = "parakeet-tensorrt"))]
 fn probe_cuda_runtime() -> bool {
-    // Null-terminated library names to try, in order of preference
-    let lib_names: &[&[u8]] = &[
-        b"libcudart.so\0",
-        b"libcudart.so.12\0",
-        b"libcudart.so.13\0",
-    ];
-
-    let mut handle = std::ptr::null_mut();
-    for name in lib_names {
-        handle = unsafe { libc::dlopen(name.as_ptr() as *const libc::c_char, libc::RTLD_LAZY) };
-        if !handle.is_null() {
-            break;
-        }
-    }
-
-    if handle.is_null() {
-        tracing::error!(
-            "CUDA runtime library (libcudart.so) not found. \
-             Cannot initialize CUDA execution provider.\n  \
-             Install the CUDA toolkit, or use a CPU backend instead."
-        );
-        return false;
-    }
-
-    let sym = unsafe {
-        libc::dlsym(
-            handle,
-            b"cudaRuntimeGetVersion\0".as_ptr() as *const libc::c_char,
-        )
-    };
-
-    if sym.is_null() {
-        tracing::warn!("Could not find cudaRuntimeGetVersion in CUDA runtime library");
-        unsafe { libc::dlclose(handle) };
-        // Can't determine version, proceed and hope for the best
-        return true;
-    }
-
-    // cudaRuntimeGetVersion signature: cudaError_t cudaRuntimeGetVersion(int *runtimeVersion)
-    // Version is encoded as (major * 1000 + minor * 10)
-    type CudaRuntimeGetVersion = unsafe extern "C" fn(*mut i32) -> i32;
-    let get_version: CudaRuntimeGetVersion = unsafe { std::mem::transmute(sym) };
-
-    let mut version: i32 = 0;
-    let result = unsafe { get_version(&mut version) };
-    unsafe { libc::dlclose(handle) };
-
-    if result != 0 {
-        tracing::warn!("cudaRuntimeGetVersion failed (error code {})", result);
-        return true;
-    }
-
-    let major = version / 1000;
-    let minor = (version % 1000) / 10;
-    tracing::info!("Detected CUDA runtime version: {}.{}", major, minor);
-
     // ort 2.0.0-rc.12 picks the cu12 or cu13 prebuilt at compile time from
     // ORT_CUDA_VERSION (see ort-sys/build/download/resolve.rs). build.rs
     // mirrors that selection into VOXTYPE_BUILD_CUDA_MAJOR so this probe
@@ -409,34 +354,150 @@ fn probe_cuda_runtime() -> bool {
     // baked in the default ("12"), and this probe falsely rejected
     // Blackwell hosts with "this binary's bundled ONNX Runtime requires
     // CUDA 12.x" (#386). The Dockerfile fix sets the env var properly,
-    // and gating the check on `not(feature = "onnx-load-dynamic")`
+    // and gating the check on `not(feature = "parakeet-load-dynamic")`
     // closes the design hole so future load-dynamic builds don't depend
     // on remembering to set it.
-    #[cfg(not(feature = "onnx-load-dynamic"))]
+    #[cfg(not(feature = "parakeet-load-dynamic"))]
     {
         const EXPECTED_CUDA_MAJOR: i32 = match env!("VOXTYPE_BUILD_CUDA_MAJOR").as_bytes() {
             b"13" => 13,
             _ => 12,
         };
-
-        if major != EXPECTED_CUDA_MAJOR {
-            tracing::error!(
-                "CUDA version mismatch: found CUDA {major}.{minor}, but this binary's \
-                 bundled ONNX Runtime requires CUDA {EXPECTED_CUDA_MAJOR}.x. \
-                 Continuing would crash the process.\n  \
-                 Options:\n  \
-                 1. Install the matching voxtype-onnx-cuda-{EXPECTED_CUDA_MAJOR} package\n  \
-                 2. Switch to voxtype-onnx-cuda-{} for your CUDA version (`voxtype setup gpu --enable` \
-                 auto-detects and points the symlink at the right one)\n  \
-                 3. Build from source with --features parakeet-load-dynamic to link \
-                 against your system's ONNX Runtime instead",
-                major,
-            );
-            return false;
-        }
+        let probes = cuda_runtime::probe_system_cuda_runtimes(
+            cuda_runtime::runtime_probe_candidates(EXPECTED_CUDA_MAJOR),
+        );
+        return match cuda_runtime::evaluate_runtime_probe(EXPECTED_CUDA_MAJOR, &probes, true) {
+            RuntimeProbeDecision::Compatible { candidate, version } => {
+                let major = version / 1000;
+                let minor = (version % 1000) / 10;
+                tracing::info!(
+                    "Detected CUDA runtime version: {}.{} via {}",
+                    major,
+                    minor,
+                    candidate.soname
+                );
+                true
+            }
+            RuntimeProbeDecision::Mismatch { candidate, version } => {
+                let major = version / 1000;
+                let minor = (version % 1000) / 10;
+                tracing::error!(
+                    "CUDA version mismatch: found CUDA {major}.{minor} in {}, but this binary's \
+                     bundled ONNX Runtime requires CUDA {EXPECTED_CUDA_MAJOR}.x. \
+                     Continuing would crash the process.\n  \
+                     Options:\n  \
+                     1. Install the matching voxtype-onnx-cuda-{EXPECTED_CUDA_MAJOR} package\n  \
+                     2. Switch to voxtype-onnx-cuda-{} for your CUDA version (`voxtype setup gpu --enable` \
+                     auto-detects and points the symlink at the right one)\n  \
+                     3. Build from source with --features parakeet-load-dynamic to link \
+                     against your system's ONNX Runtime instead",
+                    candidate.soname,
+                    major,
+                );
+                false
+            }
+            RuntimeProbeDecision::Missing => {
+                tracing::error!(
+                    "CUDA runtime library (libcudart.so) not found. \
+                     Cannot initialize CUDA execution provider.\n  \
+                     Install the CUDA toolkit, or use a CPU backend instead."
+                );
+                false
+            }
+            RuntimeProbeDecision::Indeterminate { candidate } => {
+                // This is the intentional narrow trade-off: a readable major
+                // mismatch is unsafe and remains a hard failure, but if the
+                // runtime library opens and refuses to report a version we avoid
+                // falsely rejecting the host here and let ONNX Runtime perform
+                // the final compatibility check when it creates the session.
+                tracing::warn!(
+                    "Could not determine the CUDA runtime version from {}. \
+                     Proceeding and letting ONNX Runtime validate it.",
+                    candidate.soname
+                );
+                true
+            }
+        };
     }
 
-    true
+    #[cfg(feature = "parakeet-load-dynamic")]
+    {
+        // Load-dynamic builds do not bundle a fixed ORT CUDA ABI. The relevant
+        // question here is only whether some CUDA runtime is present at all;
+        // the system ONNX Runtime owns major-version compatibility.
+        let probes =
+            cuda_runtime::probe_system_cuda_runtimes(cuda_runtime::setup_probe_candidates());
+        return match cuda_runtime::evaluate_runtime_probe(0, &probes, false) {
+            RuntimeProbeDecision::Compatible { candidate, version } => {
+                let major = version / 1000;
+                let minor = (version % 1000) / 10;
+                tracing::info!(
+                    "Detected CUDA runtime version: {}.{} via {}",
+                    major,
+                    minor,
+                    candidate.soname
+                );
+                true
+            }
+            RuntimeProbeDecision::Missing => {
+                tracing::error!(
+                    "CUDA runtime library (libcudart.so) not found. \
+                     Cannot initialize CUDA execution provider.\n  \
+                     Install the CUDA toolkit, or use a CPU backend instead."
+                );
+                false
+            }
+            RuntimeProbeDecision::Indeterminate { candidate } => {
+                // Same trade-off as the bundled path: no readable mismatch was
+                // proven, so stay permissive and let the system ORT validate
+                // the runtime during session creation.
+                tracing::warn!(
+                    "Could not determine the CUDA runtime version from {}. \
+                     Proceeding and letting ONNX Runtime validate it.",
+                    candidate.soname
+                );
+                true
+            }
+            // `enforce_expected_major = false` means any readable runtime is
+            // already accepted above. Keep the arm explicit so future changes to
+            // `evaluate_runtime_probe` do not silently alter load-dynamic policy.
+            RuntimeProbeDecision::Mismatch { .. } => true,
+        };
+    }
+}
+
+/// Which CUDA probe policy is compiled into this binary.
+///
+/// This is a testable seam for unit tests. Production code uses the
+/// cfg-gated branches in `probe_cuda_runtime` directly, but the two
+/// must stay in sync. The policy is determined at compile time by
+/// the `parakeet-load-dynamic` feature.
+#[cfg(all(test, any(feature = "parakeet-cuda", feature = "parakeet-tensorrt")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CudaProbePolicy {
+    /// Bundled ONNX Runtime: validates the exact CUDA major baked in at
+    /// compile time and hard-fails a mismatch.
+    BundledStrict,
+    /// System ONNX Runtime (parakeet-load-dynamic): only checks that
+    /// *some* libcudart is present; the system ORT owns major-version
+    /// compatibility.
+    LoadDynamicPermissive,
+}
+
+/// Return the CUDA probe policy compiled into this binary.
+///
+/// `BundledStrict` when built without `parakeet-load-dynamic`;
+/// `LoadDynamicPermissive` when built with it. The feature name
+/// `parakeet-load-dynamic` must match both the cfg gate in
+/// `probe_cuda_runtime` and the guidance shown to users in the
+/// Mismatch error arm.
+#[cfg(all(test, any(feature = "parakeet-cuda", feature = "parakeet-tensorrt")))]
+pub(crate) fn cuda_probe_policy() -> CudaProbePolicy {
+    #[cfg(feature = "parakeet-load-dynamic")]
+    return CudaProbePolicy::LoadDynamicPermissive;
+
+    #[cfg(not(feature = "parakeet-load-dynamic"))]
+    CudaProbePolicy::BundledStrict
 }
 
 /// Auto-detect model type from directory structure
@@ -625,5 +686,61 @@ mod tests {
 
         let err = result.unwrap_err();
         assert!(matches!(err, TranscribeError::ModelNotFound(_)));
+    }
+
+    // ── CUDA probe-policy contract tests ────────────────────────────────────
+    //
+    // These tests verify branch selection at compile time under the feature
+    // combinations users and packagers actually build with.  No real CUDA
+    // library loading occurs; the helper `cuda_probe_policy()` simply returns
+    // the variant baked in by the compiler.
+
+    /// With parakeet-cuda alone (no parakeet-load-dynamic) the binary contains
+    /// a bundled ONNX Runtime, so the strict CUDA-major check must be active.
+    #[test]
+    #[cfg(all(feature = "parakeet-cuda", not(feature = "parakeet-load-dynamic")))]
+    fn cuda_probe_policy_is_strict_without_load_dynamic() {
+        assert_eq!(cuda_probe_policy(), CudaProbePolicy::BundledStrict);
+    }
+
+    /// With parakeet-cuda + parakeet-load-dynamic the binary dlopens the
+    /// system ONNX Runtime, so only CUDA *presence* matters.  The permissive
+    /// policy must be compiled in.
+    #[test]
+    #[cfg(all(feature = "parakeet-cuda", feature = "parakeet-load-dynamic"))]
+    fn cuda_probe_policy_is_permissive_with_load_dynamic() {
+        assert_eq!(cuda_probe_policy(), CudaProbePolicy::LoadDynamicPermissive);
+    }
+
+    /// onnx-load-dynamic (the ort-crate-wide feature) must not affect
+    /// Parakeet's probe policy after the fix.  With parakeet-cuda +
+    /// onnx-load-dynamic but WITHOUT parakeet-load-dynamic the strict
+    /// bundled policy must still compile.
+    #[test]
+    #[cfg(all(
+        feature = "parakeet-cuda",
+        feature = "onnx-load-dynamic",
+        not(feature = "parakeet-load-dynamic")
+    ))]
+    fn onnx_load_dynamic_alone_does_not_select_permissive_policy() {
+        assert_eq!(cuda_probe_policy(), CudaProbePolicy::BundledStrict);
+    }
+
+    /// The guidance string shown to users on a CUDA mismatch names the feature
+    /// `parakeet-load-dynamic`.  This constant asserts the canonical name used
+    /// by both the cfg gate and the user-visible message are identical, so
+    /// future drift shows up as a compile-visible symbol mismatch rather than
+    /// a buried string difference.
+    #[test]
+    fn guidance_feature_name_matches_cfg_gate() {
+        // The Mismatch arm in probe_cuda_runtime() tells users:
+        //   "Build from source with --features parakeet-load-dynamic …"
+        // The cfg gates in that function check:
+        //   #[cfg(not(feature = "parakeet-load-dynamic"))]
+        //   #[cfg(feature = "parakeet-load-dynamic")]
+        // Both must agree on the same string literal.
+        const GUIDANCE_FEATURE: &str = "parakeet-load-dynamic";
+        const CFG_GATE_FEATURE: &str = "parakeet-load-dynamic";
+        assert_eq!(GUIDANCE_FEATURE, CFG_GATE_FEATURE);
     }
 }

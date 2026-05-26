@@ -231,6 +231,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(key) = cli.remote_api_key {
         config.whisper.remote_api_key = Some(key);
     }
+    if cli.allow_insecure_http {
+        config.whisper.remote_allow_insecure_http = true;
+    }
 
     // Soniox overrides
     if let Some(key) = cli.soniox_api_key {

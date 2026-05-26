@@ -747,25 +747,13 @@ fn detect_best_parakeet_gpu_backend() -> Option<(&'static str, &'static str)> {
     // silently fall back to CPU.
     let has_nvidia = gpus.iter().any(|g| g.vendor == GpuVendor::Nvidia);
     if has_nvidia {
-        let host_cuda_major = crate::setup::parakeet::detect_cuda_runtime_major();
-        let cuda_pref: &[&str] = match host_cuda_major {
-            Some(13) => &["voxtype-onnx-cuda-13", "voxtype-onnx-cuda"],
-            Some(12) => &["voxtype-onnx-cuda-12", "voxtype-onnx-cuda"],
-            // No detection — try cu13 first (rolling-distro default), then cu12
-            _ => &[
-                "voxtype-onnx-cuda-13",
-                "voxtype-onnx-cuda-12",
-                "voxtype-onnx-cuda",
-            ],
-        };
-        for name in cuda_pref {
+        let host_cuda = crate::setup::parakeet::detect_cuda_runtimes();
+        // Reuse the same helper as `setup onnx --enable` so mixed CUDA 12/13
+        // installs are handled consistently across both setup entry points.
+        for variant in crate::setup::parakeet::preferred_cuda_variant_order(&host_cuda) {
+            let name = variant.binary_name();
             if Path::new(VOXTYPE_LIB_DIR).join(name).exists() {
-                let label = match host_cuda_major {
-                    Some(13) => "CUDA 13",
-                    Some(12) => "CUDA 12",
-                    _ => "CUDA",
-                };
-                return Some((*name, label));
+                return Some((name, cuda_backend_label(name)));
             }
         }
     }
@@ -780,11 +768,19 @@ fn detect_best_parakeet_gpu_backend() -> Option<(&'static str, &'static str)> {
         "voxtype-onnx-cuda",
     ] {
         if Path::new(VOXTYPE_LIB_DIR).join(name).exists() {
-            return Some((name, "CUDA"));
+            return Some((name, cuda_backend_label(name)));
         }
     }
 
     None
+}
+
+fn cuda_backend_label(binary_name: &str) -> &'static str {
+    match binary_name {
+        "voxtype-onnx-cuda-12" => "CUDA 12",
+        "voxtype-onnx-cuda-13" => "CUDA 13",
+        _ => "CUDA",
+    }
 }
 
 /// Enable GPU backend (engine-aware: Vulkan for Whisper, CUDA/MIGraphX for Parakeet)

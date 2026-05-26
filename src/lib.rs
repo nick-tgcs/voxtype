@@ -73,6 +73,7 @@ pub mod cli;
 pub mod config;
 pub mod config_set;
 pub mod cpu;
+pub(crate) mod cuda_runtime;
 pub mod daemon;
 pub mod eager;
 pub mod error;
@@ -90,6 +91,8 @@ pub mod output;
 pub mod setup;
 pub mod state;
 pub mod text;
+#[cfg(test)]
+pub mod test_env;
 pub mod transcribe;
 pub mod tui;
 pub mod vad;

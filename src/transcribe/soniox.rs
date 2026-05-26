@@ -1184,7 +1184,7 @@ mod tests {
 
     #[test]
     fn requires_api_key_from_config_or_env() {
-        std::env::remove_var("SONIOX_API_KEY");
+        let _guard = crate::test_env::EnvGuard::remove("SONIOX_API_KEY");
         let err = SonioxTranscriber::new(cfg_with_key(None)).unwrap_err();
         assert!(matches!(err, TranscribeError::ConfigError(_)));
     }

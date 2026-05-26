@@ -484,6 +484,19 @@ voxtype -vv
 
 Look for log messages about speech detection to understand what VAD is doing with your recordings.
 
+### Model or helper asset looks corrupted
+
+**Symptom:** Setup reports a SHA-256 mismatch, `voxtype setup vad` keeps re-downloading, meeting mode loses GTCRN echo cancellation, or ML diarization drops back to the simple backend.
+
+**Repair path:**
+
+- Primary Whisper or ONNX model: rerun `voxtype setup model` and select the model again. The setup flow now re-verifies cached files and re-downloads one bad cached copy automatically before asking whether to continue.
+- VAD model: rerun `voxtype setup vad`. That command re-verifies the cached file and repairs it automatically once before prompting.
+- GTCRN echo cancellation helper: run `voxtype meeting start` again. Voxtype silently verifies the cached helper, re-downloads it once if needed, and continues without echo cancellation if repair still fails.
+- ECAPA diarization helper: start meeting mode again with `[meeting.diarization] backend = "ml"`. Voxtype silently verifies the cached helper, repairs it once if possible, and falls back to simple diarization if repair still fails.
+
+If you need an immediate workaround while repairing meeting helpers, set `[meeting.audio] echo_cancel = "disabled"` or `[meeting.diarization] backend = "simple"` temporarily.
+
 ---
 
 ## Output Problems

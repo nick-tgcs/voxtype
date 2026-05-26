@@ -446,7 +446,7 @@ Requires `whisper-cli` from [whisper.cpp](https://github.com/ggerganov/whisper.c
 ```toml
 [whisper]
 backend = "remote"
-remote_endpoint = "http://192.168.1.100:8080"
+remote_endpoint = "http://127.0.0.1:8080"
 ```
 
 ```toml
@@ -955,14 +955,39 @@ The base URL of the remote Whisper server. Must include the protocol (`http://` 
 [whisper]
 backend = "remote"
 
-# Self-hosted whisper.cpp server
-remote_endpoint = "http://192.168.1.100:8080"
+# Self-hosted whisper.cpp server on the same machine
+remote_endpoint = "http://127.0.0.1:8080"
+
+# Self-hosted remote server with TLS
+# remote_endpoint = "https://whisper.example.internal"
 
 # OpenAI API
 remote_endpoint = "https://api.openai.com"
 ```
 
-**Security note:** Voxtype logs a warning if you use HTTP (unencrypted) for non-localhost endpoints, as your audio would be transmitted in the clear.
+**Security note:** Voxtype allows `http://` without extra configuration only for loopback addresses such as `127.0.0.1`, `::1`, and `localhost`. For non-loopback endpoints it requires `https://` by default. If you intentionally use cleartext HTTP on a trusted LAN, set `remote_allow_insecure_http = true`.
+
+### remote_allow_insecure_http
+
+**Type:** Boolean
+**Default:** `false`
+**Required:** No
+
+Allow a non-loopback `http://` remote endpoint.
+
+By default, voxtype rejects cleartext HTTP for non-loopback remote transcription endpoints because your audio and any API key would be transmitted unencrypted. Leave this disabled unless you intentionally run a trusted LAN-only server without TLS.
+
+**Examples:**
+```toml
+[whisper]
+backend = "remote"
+remote_endpoint = "http://192.168.1.100:8080"
+remote_allow_insecure_http = true
+```
+
+Equivalent overrides:
+- CLI: `--allow-insecure-http`
+- Environment: `VOXTYPE_ALLOW_INSECURE_HTTP=1` or `VOXTYPE_ALLOW_INSECURE_HTTP=true`
 
 ### remote_model
 
@@ -1019,7 +1044,7 @@ Maximum time in seconds to wait for the remote server to respond. Increase for s
 ```toml
 [whisper]
 backend = "remote"
-remote_endpoint = "http://192.168.1.100:8080"
+remote_endpoint = "https://whisper.example.internal"
 remote_timeout_secs = 60  # 60 second timeout for long recordings
 ```
 
@@ -2638,7 +2663,7 @@ VAD detection algorithm to use:
   - Whisper engine: uses Whisper VAD (more accurate, requires model)
   - Parakeet engine: uses Energy VAD (fast, no model needed)
 - `energy` - Simple RMS energy-based detection. Fast and works with any engine, no model download required.
-- `whisper` - Silero VAD via whisper-rs. More accurate speech detection but requires downloading the VAD model with `voxtype setup vad`.
+- `whisper` - Silero VAD via whisper-rs. More accurate speech detection but requires downloading the VAD model with `voxtype setup vad`. That setup command verifies a cached VAD file before reusing it, repairs one bad cached copy automatically, and only prompts if the repair still fails. Normal runtime VAD loading does not auto-download or prompt.
 
 **Example:**
 ```toml
@@ -2777,7 +2802,7 @@ pactl list short sources | grep monitor
 
 Echo cancellation mode for removing speaker bleed-through from the microphone signal when loopback capture is active.
 
-- `"auto"` - Use GTCRN neural speech enhancement on mic audio before transcription, followed by a phrase-level transcript dedup pass. The GTCRN model (~523 KB) is automatically downloaded on first `voxtype meeting start`.
+- `"auto"` - Use GTCRN neural speech enhancement on mic audio before transcription, followed by a phrase-level transcript dedup pass. The GTCRN model (~523 KB) is automatically downloaded on first `voxtype meeting start`. Cached copies are verified silently on reuse. If verification fails, voxtype re-downloads once automatically and falls back to no enhancement if repair still fails.
 - `"disabled"` - No enhancement. Use this if you have system-level echo cancellation configured (e.g., PipeWire's `echo-cancel` module) or if you don't use loopback capture.
 
 **Example:**
@@ -2810,7 +2835,7 @@ Enable speaker diarization to identify different speakers in meeting transcripts
 Diarization backend to use:
 
 - `"simple"` - Uses audio source (mic vs loopback) to attribute speech as "You" or "Remote". No model download required.
-- `"ml"` - ONNX-based speaker embeddings (ECAPA-TDNN) to identify individual remote speakers. The model is downloaded automatically on first use. **Experimental:** speaker clustering works best with longer speech segments; short segments may produce too many unique speaker IDs.
+- `"ml"` - ONNX-based speaker embeddings (ECAPA-TDNN) to identify individual remote speakers. The model is downloaded automatically on first use. Cached copies are verified silently on reuse. If verification fails, voxtype re-downloads once automatically and falls back to simple diarization if repair still fails. **Experimental:** speaker clustering works best with longer speech segments; short segments may produce too many unique speaker IDs.
 - `"remote"` - Remote diarization API.
 
 ### max_speakers
@@ -3104,6 +3129,7 @@ Any config file setting can be overridden via environment variable. These are ap
 | `VOXTYPE_GPU_DEVICE` | integer | `whisper.gpu_device` |
 | `VOXTYPE_ON_DEMAND_LOADING` | bool | `whisper.on_demand_loading` |
 | `VOXTYPE_REMOTE_ENDPOINT` | string | `whisper.remote_endpoint` |
+| `VOXTYPE_ALLOW_INSECURE_HTTP` | bool (`1`/`true` enables; other values disable) | `whisper.remote_allow_insecure_http` |
 | `VOXTYPE_WHISPER_API_KEY` | string | `whisper.remote_api_key` |
 
 **Audio:**
@@ -3299,9 +3325,13 @@ Offload transcription to a GPU server on your local network:
 backend = "remote"
 language = "en"
 
-# Your whisper.cpp server
-remote_endpoint = "http://192.168.1.100:8080"
+# Preferred: TLS in front of your whisper.cpp server
+remote_endpoint = "https://whisper.example.internal"
 remote_timeout_secs = 30
+
+# If you intentionally use cleartext HTTP on a trusted LAN instead:
+# remote_endpoint = "http://192.168.1.100:8080"
+# remote_allow_insecure_http = true
 ```
 
 On your GPU server, run whisper.cpp server:
