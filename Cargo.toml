@@ -75,7 +75,7 @@ which = "7"
 tempfile = "3"
 
 # Audio playback (for feedback sounds)
-rodio = { version = "0.19", default-features = false, features = ["wav"] }
+rodio = { version = "0.22", default-features = false, features = ["wav"] }
 
 # Whisper speech-to-text
 whisper-rs = "0.16.0"
