@@ -94,6 +94,8 @@ pub mod text;
 #[cfg(test)]
 pub mod test_env;
 pub mod transcribe;
+#[cfg(target_os = "linux")]
+pub mod tray;
 pub mod tui;
 pub mod vad;
 
