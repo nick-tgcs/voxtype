@@ -1,0 +1,31 @@
+name: Dependabot auto-merge
+
+# pull_request_target runs with write permissions even for bot-authored PRs.
+# Safe here because we gate strictly on github.actor == 'dependabot[bot]'.
+on: pull_request_target
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    name: Auto-merge
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]'
+    steps:
+      # Approve the PR. github-actions[bot] is a different actor from
+      # dependabot[bot], so this satisfies the require-review ruleset.
+      - name: Approve PR
+        run: gh pr review --approve "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Enable auto-merge. The actual merge is deferred until all required
+      # status checks (ci-success) pass — enforced by the protect-dev ruleset.
+      - name: Enable auto-merge
+        run: gh pr merge --auto --merge "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
