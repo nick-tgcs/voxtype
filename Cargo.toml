@@ -102,7 +102,7 @@ pidlock = "0.1"
 # TUI for `voxtype configure`
 ratatui = "0.29"
 crossterm = "0.28"
-toml_edit = "0.22"
+toml_edit = "0.23"
 
 # Meeting mode (Pro feature)
 uuid = { version = "1", features = ["v4", "serde"] }
