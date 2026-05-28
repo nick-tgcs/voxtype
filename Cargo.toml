@@ -107,7 +107,7 @@ toml_edit = "0.22"
 # Meeting mode (Pro feature)
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # OSD native frontend (SCTK + wgpu + egui-wgpu). All optional, gated by the
 # `osd-native` feature so users not opting in don't pay the build cost.
