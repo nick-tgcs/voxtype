@@ -327,7 +327,7 @@ jobs:
           echo "Resolved VERSION=${VERSION}"
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           # Pull each matrix-job artifact (named voxtype-${VERSION}-linux-${arch}-${variant})
