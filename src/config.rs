@@ -1811,6 +1811,15 @@ impl Default for MeetingConfig {
     }
 }
 
+/// Visual style for the Linux StatusNotifierItem icon.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrayIconStyle {
+    #[default]
+    Microphone,
+    Waveform,
+}
+
 /// System tray configuration (StatusNotifierItem protocol, Linux only at runtime).
 ///
 /// The field is present on all platforms so that config files round-trip
@@ -1818,6 +1827,10 @@ impl Default for MeetingConfig {
 /// the target is Linux and `enabled` is true.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TrayConfig {
+    /// Use a microphone or a purple, audio-reactive waveform.
+    #[serde(default)]
+    pub icon_style: TrayIconStyle,
+
     /// Enable the system tray icon. When true, the daemon registers an SNI
     /// tray icon that shows recording state. Requires compatible icons to be
     /// installed (run `voxtype setup icons`).
@@ -1827,7 +1840,10 @@ pub struct TrayConfig {
 
 impl Default for TrayConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            icon_style: TrayIconStyle::default(),
+        }
     }
 }
 

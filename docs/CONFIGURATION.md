@@ -3406,3 +3406,28 @@ The following configuration options are deprecated but still supported for backw
 |-------------------|-------------|-------|
 | `wtype_delay_ms` | `pre_type_delay_ms` | Renamed for clarity (applies to all output drivers, not just wtype) |
 | `--wtype-delay` CLI flag | `--pre-type-delay` | CLI equivalent of the above |
+
+## Linux tray waveform
+
+With the native StatusNotifierItem tray enabled, select the optional purple
+waveform instead of the default microphone icons:
+
+```toml
+[tray]
+enabled = true
+icon_style = "waveform" # default: "microphone"
+```
+
+Restart Voxtype after changing the style. GNOME requires the AppIndicator /
+KStatusNotifierItem extension; KDE Plasma supports SNI directly. The Omarchy
+Waybar custom module is a separate integration and does not use this setting.
+
+The waveform stays flat and dim while idle. During recording, eight purple bars
+show recent microphone levels; during transcription, a sweeping animation shows
+that Voxtype is working. Both the normal and attention pixmaps use the same
+waveform so SNI hosts cannot replace the recording frame with a microphone icon.
+The waveform style needs no installed icon files and no GTK or layer-shell
+support. Audio comes from the daemon's existing level stream, not a second
+microphone capture. The animation timer and level subscriber are inactive at idle.
+
+See the [GNOME top-bar screenshots](screenshots/tray-waveform.md).

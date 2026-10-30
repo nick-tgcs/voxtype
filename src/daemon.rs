@@ -2156,16 +2156,20 @@ impl Daemon {
         // Spawn the system tray icon if enabled (Linux, StatusNotifierItem).
         #[cfg(target_os = "linux")]
         if self.config.tray.enabled {
-            // Ensure icons are installed — silently installs on first run.
-            // Run in spawn_blocking so filesystem I/O doesn't stall the async runtime.
-            match tokio::task::spawn_blocking(crate::setup::icons::install).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::debug!("Tray icon install skipped: {}", e),
-                Err(e) => tracing::debug!("Tray icon install task panicked: {}", e),
+            // Waveform pixmaps are self-contained; only the microphone style
+            // needs files in the user's icon theme.
+            if self.config.tray.icon_style == crate::config::TrayIconStyle::Microphone {
+                // Ensure icons are installed — silently installs on first run.
+                // Run in spawn_blocking so filesystem I/O doesn't stall the async runtime.
+                match tokio::task::spawn_blocking(crate::setup::icons::install).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::debug!("Tray icon install skipped: {}", e),
+                    Err(e) => tracing::debug!("Tray icon install task panicked: {}", e),
+                }
             }
             let (tx, rx) = tokio::sync::watch::channel(crate::tray::TrayState::Idle);
             self.tray_tx = Some(tx);
-            self.tray_task = Some(crate::tray::spawn(rx));
+            self.tray_task = Some(crate::tray::spawn(rx, self.config.tray.icon_style));
         }
 
         // Check if another instance is already running (single-instance safeguard)

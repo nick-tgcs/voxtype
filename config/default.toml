@@ -234,3 +234,7 @@ icon_theme = "emoji"
 # Enable the system tray icon. Shows a blue mic when idle, red when recording.
 # Requires icons to be installed first: voxtype setup icons
 enabled = true
+
+# Optional purple waveform: live levels while recording, a sweep while transcribing.
+# Uses native SNI pixmaps; no icon-theme installation is needed for this style.
+# icon_style = "waveform"
